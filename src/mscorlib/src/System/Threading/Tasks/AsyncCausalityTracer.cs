@@ -86,10 +86,10 @@ namespace System.Threading.Tasks
         internal static void EnableToETW(bool enabled)
         {
 #if FEATURE_COMINTEROP
-            if (enabled)
-                f_LoggingOn |= Loggers.ETW;
-            else
-                f_LoggingOn &= ~Loggers.ETW;
+            //if (enabled)
+            //    f_LoggingOn |= Loggers.ETW;
+            //else
+            //    f_LoggingOn &= ~Loggers.ETW;
 #endif
         }
 
@@ -163,10 +163,10 @@ namespace System.Threading.Tasks
 
         private static void TracingStatusChangedHandler(Object sender, WFD.TracingStatusChangedEventArgs args)
         {
-            if (args.Enabled)
-                f_LoggingOn |= Loggers.CausalityTracer;
-            else
-                f_LoggingOn &= ~Loggers.CausalityTracer;
+            //if (args.Enabled)
+            //    f_LoggingOn |= Loggers.CausalityTracer;
+            //else
+            //    f_LoggingOn &= ~Loggers.CausalityTracer;
         }
 #endif
 
