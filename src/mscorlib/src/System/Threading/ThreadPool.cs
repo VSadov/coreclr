@@ -22,6 +22,9 @@ using System.Runtime.InteropServices;
 using System.Security;
 using Microsoft.Win32;
 
+//TODO: VS remove
+//[assembly: System.Diagnostics.Debuggable(true, true)]
+
 namespace System.Threading
 {
     internal static class ThreadPoolGlobals
@@ -41,357 +44,642 @@ namespace System.Threading
     [StructLayout(LayoutKind.Sequential)] // enforce layout so that padding reduces false sharing
     internal sealed class ThreadPoolWorkQueue
     {
-        internal static class WorkStealingQueueList
+        public class WorkStealingQueue
         {
-            private static volatile WorkStealingQueue[] _queues = new WorkStealingQueue[0];
+            // This implementation provides an unbounded, multi-producer multi-consumer queue
+            // that supports the standard Enqueue/Dequeue operations.
+            // It is composed of a linked list of bounded ring buffers, each of which has a head
+            // and a tail index, isolated from each other to minimize false sharing.  As long as
+            // the number of elements in the queue remains less than the size of the current
+            // buffer (Segment), no additional allocations are required for enqueued items.  When
+            // the number of items exceeds the size of the current segment, the current segment is
+            // "frozen" to prevent further enqueues, and a new segment is linked from it and set
+            // as the new tail segment for subsequent enqueues.  As old segments are consumed by
+            // dequeues, the head reference is updated to point to the segment that dequeuers should
+            // try next.
+            // The queue also supports Pop operation from the enqueuing end or by selectively removing
+            // particular items. 
+            // Items can be Popped only from the tail segment. 
+            // Older segments are supposed to be consumed by dequeues and retired.
 
-            public static WorkStealingQueue[] Queues => _queues;
+            /// <summary>
+            /// Initial length of the segments used in the queue. 
+            /// </summary>
+            private static int InitialSegmentLength = 32;
 
-            public static void Add(WorkStealingQueue queue)
+            /// <summary>
+            /// Maximum length of the segments used in the queue.  This is a somewhat arbitrary limit:
+            /// larger means that as long as we don't exceed the size, we avoid allocating more segments,
+            /// but if we do exceed it, then the segment becomes garbage.
+            /// </summary>
+            private const int MaxSegmentLength = 1024 * 1024;
+
+            private const int removeRange = 1024;
+
+            /// <summary>
+            /// Lock used to protect cross-segment operations, including any updates to <see cref="_enqSegment"/> or <see cref="_deqSegment"/>
+            /// and any operations that need to get a consistent view of them.
+            /// </summary>
+            private object _crossSegmentLock;
+            /// <summary>The current enqueue segment.</summary>
+            internal WorkStealingQueueSegment _enqSegment;
+            /// <summary>The current dequeue segment.</summary>
+            internal WorkStealingQueueSegment _deqSegment;
+
+            /// <summary>
+            /// Initializes a new instance of the <see cref="WorkStealingQueue"/> class.
+            /// </summary>
+            public WorkStealingQueue()
             {
-                Debug.Assert(queue != null);
-                while (true)
-                {
-                    WorkStealingQueue[] oldQueues = _queues;
-                    Debug.Assert(Array.IndexOf(oldQueues, queue) == -1);
+                _crossSegmentLock = new object();
+                _enqSegment = _deqSegment = new WorkStealingQueueSegment(InitialSegmentLength);
+            }
 
-                    var newQueues = new WorkStealingQueue[oldQueues.Length + 1];
-                    Array.Copy(oldQueues, 0, newQueues, 0, oldQueues.Length);
-                    newQueues[newQueues.Length - 1] = queue;
-                    if (Interlocked.CompareExchange(ref _queues, newQueues, oldQueues) == oldQueues)
-                    {
-                        break;
-                    }
+            /// <summary>
+            /// Adds an object to the end of the <see cref="WorkStealingQueue"/>
+            /// </summary>
+            public void PushOrEnqueue(IThreadPoolWorkItem item)
+            {
+                var enq = _enqSegment;
+
+                // if we popped before, try reuse that space via pushing, otherwise enqueue.
+                int pushIndex = enq._queueEnds.Push;
+                if (pushIndex == enq._queueEnds.Enqueue || !enq.TryPush(item, pushIndex))
+                {
+                    Enqueue(item);
                 }
             }
 
-            public static void Remove(WorkStealingQueue queue)
+            public void Enqueue(IThreadPoolWorkItem item)
             {
-                Debug.Assert(queue != null);
-                while (true)
+                // try enqueuing. Should normally succeed unless we need a new segment.
+                if (!_enqSegment.TryEnqueue(item))
                 {
-                    WorkStealingQueue[] oldQueues = _queues;
-                    if (oldQueues.Length == 0)
+                    // If we're unable to, we need to take a slow path that will
+                    // try to add a new tail segment.
+                    EnqueueSlow(item);
+                }
+            }
+
+            /// <summary>Adds to the end of the queue, adding a new segment if necessary.</summary>
+            private void EnqueueSlow(IThreadPoolWorkItem item)
+            {
+                for (; ; )
+                {
+                    WorkStealingQueueSegment enq = _enqSegment;
+
+                    // If we were unsuccessful, take the lock so that we can compare and manipulate
+                    // the tail.  Assuming another enqueuer hasn't already added a new segment,
+                    // do so, then loop around to try enqueueing again.
+                    lock (_crossSegmentLock)
+                    {
+                        if (enq == _enqSegment)
+                        {
+                            // Make sure no one else can enqueue to this segment.
+                            enq.EnsureFrozenForEnqueues();
+
+                            // We determine the new segment's length based on the old length.
+                            // In general, we double the size of the segment, to make it less likely
+                            // that we'll need to grow again.  
+                            int nextSize = Math.Min(enq._slots.Length * 2, MaxSegmentLength);
+                            var newEnq = new WorkStealingQueueSegment(nextSize);
+
+                            // Hook up the new tail.
+                            enq._nextSegment = newEnq;
+                            _enqSegment = newEnq;
+                        }
+                    }
+
+                    // Try to append to the existing tail.
+                    if (_enqSegment.TryEnqueue(item))
                     {
                         return;
                     }
-
-                    int pos = Array.IndexOf(oldQueues, queue);
-                    if (pos == -1)
-                    {
-                        Debug.Fail("Should have found the queue");
-                        return;
-                    }
-
-                    var newQueues = new WorkStealingQueue[oldQueues.Length - 1];
-                    if (pos == 0)
-                    {
-                        Array.Copy(oldQueues, 1, newQueues, 0, newQueues.Length);
-                    }
-                    else if (pos == oldQueues.Length - 1)
-                    {
-                        Array.Copy(oldQueues, 0, newQueues, 0, newQueues.Length);
-                    }
-                    else
-                    {
-                        Array.Copy(oldQueues, 0, newQueues, 0, pos);
-                        Array.Copy(oldQueues, pos + 1, newQueues, pos, newQueues.Length - pos);
-                    }
-
-                    if (Interlocked.CompareExchange(ref _queues, newQueues, oldQueues) == oldQueues)
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-
-        internal sealed class WorkStealingQueue
-        {
-            private const int INITIAL_SIZE = 32;
-            internal volatile IThreadPoolWorkItem[] m_array = new IThreadPoolWorkItem[INITIAL_SIZE];
-            private volatile int m_mask = INITIAL_SIZE - 1;
-
-#if DEBUG
-            // in debug builds, start at the end so we exercise the index reset logic.
-            private const int START_INDEX = int.MaxValue;
-#else
-            private const int START_INDEX = 0;
-#endif
-
-            private volatile int m_headIndex = START_INDEX;
-            private volatile int m_tailIndex = START_INDEX;
-
-            private SpinLock m_foreignLock = new SpinLock(enableThreadOwnerTracking: false);
-
-            public void LocalPush(IThreadPoolWorkItem obj)
-            {
-                int tail = m_tailIndex;
-
-                // We're going to increment the tail; if we'll overflow, then we need to reset our counts
-                if (tail == int.MaxValue)
-                {
-                    bool lockTaken = false;
-                    try
-                    {
-                        m_foreignLock.Enter(ref lockTaken);
-
-                        if (m_tailIndex == int.MaxValue)
-                        {
-                            //
-                            // Rather than resetting to zero, we'll just mask off the bits we don't care about.
-                            // This way we don't need to rearrange the items already in the queue; they'll be found
-                            // correctly exactly where they are.  One subtlety here is that we need to make sure that
-                            // if head is currently < tail, it remains that way.  This happens to just fall out from
-                            // the bit-masking, because we only do this if tail == int.MaxValue, meaning that all
-                            // bits are set, so all of the bits we're keeping will also be set.  Thus it's impossible
-                            // for the head to end up > than the tail, since you can't set any more bits than all of 
-                            // them.
-                            //
-                            m_headIndex = m_headIndex & m_mask;
-                            m_tailIndex = tail = m_tailIndex & m_mask;
-                            Debug.Assert(m_headIndex <= m_tailIndex);
-                        }
-                    }
-                    finally
-                    {
-                        if (lockTaken)
-                            m_foreignLock.Exit(useMemoryBarrier: true);
-                    }
-                }
-
-                // When there are at least 2 elements' worth of space, we can take the fast path.
-                if (tail < m_headIndex + m_mask)
-                {
-                    Volatile.Write(ref m_array[tail & m_mask], obj);
-                    m_tailIndex = tail + 1;
-                }
-                else
-                {
-                    // We need to contend with foreign pops, so we lock.
-                    bool lockTaken = false;
-                    try
-                    {
-                        m_foreignLock.Enter(ref lockTaken);
-
-                        int head = m_headIndex;
-                        int count = m_tailIndex - m_headIndex;
-
-                        // If there is still space (one left), just add the element.
-                        if (count >= m_mask)
-                        {
-                            // We're full; expand the queue by doubling its size.
-                            var newArray = new IThreadPoolWorkItem[m_array.Length << 1];
-                            for (int i = 0; i < m_array.Length; i++)
-                                newArray[i] = m_array[(i + head) & m_mask];
-
-                            // Reset the field values, incl. the mask.
-                            m_array = newArray;
-                            m_headIndex = 0;
-                            m_tailIndex = tail = count;
-                            m_mask = (m_mask << 1) | 1;
-                        }
-
-                        Volatile.Write(ref m_array[tail & m_mask], obj);
-                        m_tailIndex = tail + 1;
-                    }
-                    finally
-                    {
-                        if (lockTaken)
-                            m_foreignLock.Exit(useMemoryBarrier: false);
-                    }
                 }
             }
 
-            [SuppressMessage("Microsoft.Concurrency", "CA8001", Justification = "Reviewed for thread safety")]
-            public bool LocalFindAndPop(IThreadPoolWorkItem obj)
+            /// <summary>
+            /// Removes an object at the beginning of the <see cref="WorkStealingQueue"/>
+            /// Returns null if the queue is empty.
+            /// </summary>
+            public IThreadPoolWorkItem Dequeue()
             {
-                // Fast path: check the tail. If equal, we can skip the lock.
-                if (m_array[(m_tailIndex - 1) & m_mask] == obj)
+                var currentSegment = _deqSegment;
+                IThreadPoolWorkItem result = currentSegment.TryDequeue();
+
+                if (result == null && currentSegment._nextSegment != null)
                 {
-                    IThreadPoolWorkItem unused = LocalPop();
-                    Debug.Assert(unused == null || unused == obj);
-                    return unused != null;
+                    // slow path that fixes up segments
+                    result = TryDequeueSlow(currentSegment);
                 }
 
-                // Else, do an O(N) search for the work item. The theory of work stealing and our
-                // inlining logic is that most waits will happen on recently queued work.  And
-                // since recently queued work will be close to the tail end (which is where we
-                // begin our search), we will likely find it quickly.  In the worst case, we
-                // will traverse the whole local queue; this is typically not going to be a
-                // problem (although degenerate cases are clearly an issue) because local work
-                // queues tend to be somewhat shallow in length, and because if we fail to find
-                // the work item, we are about to block anyway (which is very expensive).
-                for (int i = m_tailIndex - 2; i >= m_headIndex; i--)
-                {
-                    if (m_array[i & m_mask] == obj)
-                    {
-                        // If we found the element, block out steals to avoid interference.
-                        bool lockTaken = false;
-                        try
-                        {
-                            m_foreignLock.Enter(ref lockTaken);
-
-                            // If we encountered a race condition, bail.
-                            if (m_array[i & m_mask] == null)
-                                return false;
-
-                            // Otherwise, null out the element.
-                            Volatile.Write(ref m_array[i & m_mask], null);
-
-                            // And then check to see if we can fix up the indexes (if we're at
-                            // the edge).  If we can't, we just leave nulls in the array and they'll
-                            // get filtered out eventually (but may lead to superfluous resizing).
-                            if (i == m_tailIndex)
-                                m_tailIndex -= 1;
-                            else if (i == m_headIndex)
-                                m_headIndex += 1;
-
-                            return true;
-                        }
-                        finally
-                        {
-                            if (lockTaken)
-                                m_foreignLock.Exit(useMemoryBarrier: false);
-                        }
-                    }
-                }
-
-                return false;
+                return result;
             }
 
-            public IThreadPoolWorkItem LocalPop() => m_headIndex < m_tailIndex ? LocalPopCore() : null;
-
-            [SuppressMessage("Microsoft.Concurrency", "CA8001", Justification = "Reviewed for thread safety")]
-            private IThreadPoolWorkItem LocalPopCore()
+            /// <summary>
+            /// Tries to dequeue an item, removing empty segments as needed.
+            /// </summary>
+            private IThreadPoolWorkItem TryDequeueSlow(WorkStealingQueueSegment currentSegment)
             {
-                while (true)
+                IThreadPoolWorkItem result;
+                for (; ; )
                 {
-                    int tail = m_tailIndex;
-                    if (m_headIndex >= tail)
+                    // At this point we know that there is a next segment, which means
+                    // this segment has been frozen for additional enqueues. But between
+                    // the time that we ran TryDequeue and checked for a next segment,
+                    // another item could have been added.  Try to dequeue one more time
+                    // to confirm that the segment is indeed empty.
+                    Debug.Assert(currentSegment._frozenForEnqueues);
+                    result = currentSegment.TryDequeue();
+                    if (result != null)
+                    {
+                        return result;
+                    }
+
+                    // This segment is frozen (nothing more can be added) and empty (nothing is in it).
+                    // Update head to point to the next segment in the list, assuming no one's beat us to it.
+                    lock (_crossSegmentLock)
+                    {
+                        if (currentSegment == _deqSegment)
+                        {
+                            _deqSegment = currentSegment._nextSegment;
+                        }
+                    }
+
+                    // Get the current head
+                    currentSegment = _deqSegment;
+
+                    // Try to take.  If we're successful, we're done.
+                    result = currentSegment.TryDequeue();
+                    if (result != null)
+                    {
+                        return result;
+                    }
+
+                    // Check to see whether this segment is the last. If it is, we can consider
+                    // this to be a moment-in-time when the queue is empty.
+                    if (currentSegment._nextSegment == null)
                     {
                         return null;
                     }
-
-                    // Decrement the tail using a fence to ensure subsequent read doesn't come before.
-                    tail -= 1;
-                    Interlocked.Exchange(ref m_tailIndex, tail);
-
-                    // If there is no interaction with a take, we can head down the fast path.
-                    if (m_headIndex <= tail)
-                    {
-                        int idx = tail & m_mask;
-                        IThreadPoolWorkItem obj = Volatile.Read(ref m_array[idx]);
-
-                        // Check for nulls in the array.
-                        if (obj == null) continue;
-
-                        m_array[idx] = null;
-                        return obj;
-                    }
-                    else
-                    {
-                        // Interaction with takes: 0 or 1 elements left.
-                        bool lockTaken = false;
-                        try
-                        {
-                            m_foreignLock.Enter(ref lockTaken);
-
-                            if (m_headIndex <= tail)
-                            {
-                                // Element still available. Take it.
-                                int idx = tail & m_mask;
-                                IThreadPoolWorkItem obj = Volatile.Read(ref m_array[idx]);
-
-                                // Check for nulls in the array.
-                                if (obj == null) continue;
-
-                                m_array[idx] = null;
-                                return obj;
-                            }
-                            else
-                            {
-                                // If we encountered a race condition and element was stolen, restore the tail.
-                                m_tailIndex = tail + 1;
-                                return null;
-                            }
-                        }
-                        finally
-                        {
-                            if (lockTaken)
-                                m_foreignLock.Exit(useMemoryBarrier: false);
-                        }
-                    }
                 }
             }
 
-            public bool CanSteal => m_headIndex < m_tailIndex;
-
-            public IThreadPoolWorkItem TrySteal(ref bool missedSteal)
+            /// <summary>
+            /// Returns true if an item can be dequeued.
+            /// There are no gurantees, obviously, since the queue may concurrently change. Just a cheap check.
+            /// </summary>
+            public bool CanSteal
             {
-                while (true)
+                get
                 {
-                    if (CanSteal)
+                    var deqSegment = this._deqSegment;
+                    var dequeue = Volatile.Read(ref deqSegment._queueEnds.Dequeue);
+
+                    // have multiple segments - definitely can benefit from stealing
+                    // otherwise read Dequeue and _then_ Enqueue. If not the same, there is work for dequeuer.
+                    return deqSegment != this._enqSegment |
+                                dequeue != deqSegment._queueEnds.Enqueue;
+                }
+            }
+
+            public IThreadPoolWorkItem Pop()
+            {
+                return this._enqSegment.TryPop();
+            }
+
+            internal bool LocalFindAndPop(IThreadPoolWorkItem callback)
+            {
+                return this._enqSegment.TryRemove(callback);
+            }
+
+            /// <summary>
+            /// Provides a multi-producer, multi-consumer thread-safe bounded segment.  When the queue is full,
+            /// enqueues fail and return false.  When the queue is empty, dequeues fail and return null.
+            /// These segments are linked together to form the unbounded <see cref="WorkStealingQueue"/>. 
+            /// </summary>
+            internal sealed class WorkStealingQueueSegment
+            {
+                // Segment design is inspired by the algorithm outlined at:
+                // http://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue
+
+                /// <summary>The array of items in this queue.  Each slot contains the item in that slot and its "sequence number".</summary>
+                internal readonly Slot[] _slots;
+                /// <summary>Mask for quickly accessing a position within the queue's array.</summary>
+                internal readonly int _slotsMask;
+                /// <summary>The head and tail positions, with padding to help avoid false sharing contention.</summary>
+                /// <remarks>Dequeuing happens from the head, enqueuing happens at the tail.</remarks>
+                internal PaddedHeadAndTail _queueEnds; // mutable struct: do not make this readonly
+
+                /// <summary>Indicates whether the segment has been marked such that no additional items may be enqueued.</summary>
+                internal bool _frozenForEnqueues;
+                /// <summary>The segment following this one in the queue, or null if this segment is the last in the queue.</summary>
+                internal WorkStealingQueueSegment _nextSegment;
+
+
+                private const int Empty = 0;
+                private const int Full = 1;
+                private const int Changing = 2;
+
+                /// <summary>Creates the segment.</summary>
+                /// <param name="boundedLength">
+                /// The maximum number of elements the segment can contain.  Must be a power of 2.
+                /// </param>
+                internal WorkStealingQueueSegment(int boundedLength)
+                {
+                    // Validate the length
+                    Debug.Assert(boundedLength >= 2, $"Must be >= 2, got {boundedLength}");
+                    Debug.Assert((boundedLength & (boundedLength - 1)) == 0, $"Must be a power of 2, got {boundedLength}");
+
+                    // Initialize the slots and the mask.  The mask is used as a way of quickly doing "% _slots.Length",
+                    // instead letting us do "& _slotsMask".
+                    var slots = new Slot[boundedLength];
+                    _slotsMask = boundedLength - 1;
+
+                    // Initialize the sequence number for each slot.  The sequence number provides a ticket that
+                    // allows dequeuers to know whether they can dequeue and enqueuers to know whether they can
+                    // enqueue.  An enqueuer at position N can enqueue when the sequence number is N, and a dequeuer
+                    // for position N can dequeue when the sequence number is N + 1.  When an enqueuer is done writing
+                    // at position N, it sets the sequence number to N + 1 so that a dequeuer will be able to dequeue,
+                    // and when a dequeuer is done dequeueing at position N, it sets the sequence number to N + _slots.Length,
+                    // so that when an enqueuer loops around the slots, it'll find that the sequence number at
+                    // position N is N.  This also means that when an enqueuer finds that at position N the sequence
+                    // number is < N, there is still a value in that slot, i.e. the segment is full, and when a
+                    // dequeuer finds that the value in a slot is < N + 1, there is nothing currently available to
+                    // dequeue. (It is possible for multiple enqueuers to enqueue concurrently, writing into
+                    // subsequent slots, and to have the first enqueuer take longer, so that the slots for 1, 2, 3, etc.
+                    // may have values, but the 0th slot may still be being filled... in that case, TryDequeue will
+                    // return false.)
+                    for (int i = 0; i < slots.Length; i++)
                     {
-                        bool taken = false;
-                        try
+                        slots[i].SequenceNumber = i;
+                    }
+
+                    this._slots = slots;
+                }
+
+                /// <summary>Gets the "freeze offset" for this segment.</summary>
+                internal int FreezeOffset => _slots.Length * 4;
+
+                /// <summary>
+                /// Ensures that the segment will not accept any subsequent enqueues that aren't already underway.
+                /// </summary>
+                /// <remarks>
+                /// When we mark a segment as being frozen for additional enqueues,
+                /// we set the <see cref="_frozenForEnqueues"/> bool, but that's mostly
+                /// as a small helper to avoid marking it twice.  The real marking comes
+                /// by modifying the Tail for the segment, increasing it by this
+                /// <see cref="FreezeOffset"/>.  This effectively knocks it off the
+                /// sequence expected by future enqueuers, such that any additional enqueuer
+                /// will be unable to enqueue due to it not lining up with the expected
+                /// sequence numbers.  This value is chosen specially so that Tail will grow
+                /// to a value that maps to the same slot but that won't be confused with
+                /// any other enqueue/dequeue sequence number.
+                /// </remarks>
+                internal void EnsureFrozenForEnqueues() // must only be called while queue's segment lock is held
+                {
+                    if (!_frozenForEnqueues) // flag used to ensure we don't increase the Tail more than once if frozen more than once
+                    {
+                        _frozenForEnqueues = true;
+
+                        // Increase the tail by FreezeOffset, spinning until we're successful in doing so.
+                        var spinner = new SpinWait();
+                        for (; ; )
                         {
-                            m_foreignLock.TryEnter(ref taken);
-                            if (taken)
+                            int tail = Volatile.Read(ref _queueEnds.Enqueue);
+                            if (Interlocked.CompareExchange(ref _queueEnds.Enqueue, tail + FreezeOffset, tail) == tail)
                             {
-                                // Increment head, and ensure read of tail doesn't move before it (fence).
-                                int head = m_headIndex;
-                                Interlocked.Exchange(ref m_headIndex, head + 1);
+                                break;
+                            }
+                            spinner.SpinOnce();
+                        }
+                    }
+                }
 
-                                if (head < m_tailIndex)
-                                {
-                                    int idx = head & m_mask;
-                                    IThreadPoolWorkItem obj = Volatile.Read(ref m_array[idx]);
+                /// <summary>
+                /// Attempts to enqueue the item.  If successful, the item will be stored
+                /// in the queue and true will be returned; otherwise, the item won't be stored, and false
+                /// will be returned.
+                /// </summary>
+                public bool TryEnqueue(IThreadPoolWorkItem item)
+                {
+                    // Loop in case of contention...
+                    var spinner = new SpinWait();
 
-                                    // Check for nulls in the array.
-                                    if (obj == null) continue;
+                    for (; ; )
+                    {
+                        var slots = _slots;
+                        var slotsMask = _slotsMask;
 
-                                    m_array[idx] = null;
-                                    return obj;
-                                }
-                                else
-                                {
-                                    // Failed, restore head.
-                                    m_headIndex = head;
-                                }
+                        // Get the position at which to try to enqueue.
+                        // must read before SequenceNumber. 
+                        // If we see old SequenceNumber, we might see the segment as full and force a new segment unnecessary
+                        int position = Volatile.Read(ref _queueEnds.Enqueue);
+                        ref var slot = ref slots[position & slotsMask];
+
+                        // Read the sequence number for the enqueue position.
+                        int sequenceNumber = slot.SequenceNumber;
+
+                        // The slot is empty and ready for us to enqueue into it if its sequence
+                        // number matches the slot.
+                        int diff = sequenceNumber - position;
+                        if (diff == 0)
+                        {
+                            // Reserve the slot for Enqueuing.
+                            //
+                            // WARNING:
+                            // The next few lines are not reliable on a runtime that
+                            // supports thread aborts. If a thread abort were to sneak in after the CompareExchange
+                            // but before the write to SequenceNumber, anyone trying to modify this slot would
+                            // spin indefinitely.  If this implementation is ever used on such a platform, this
+                            // if block should be wrapped in a finally / prepared region.
+                            if (Interlocked.CompareExchange(ref _queueEnds.Enqueue, position + 1, position) == position)
+                            {
+                                // Successfully reserved the slot.  Note that after the above CompareExchange, other threads
+                                // trying to return will end up spinning until we do the subsequent Write.                               
+                                slot.Item = item;
+                                Volatile.Write(ref slot.SequenceNumber, position + Full);
+
+                                _queueEnds.Push = position + 1;
+                                return true;
                             }
                         }
-                        finally
+                        else if (diff < 0)
                         {
-                            if (taken)
-                                m_foreignLock.Exit(useMemoryBarrier: false);
+                            // The sequence number was less than what we needed, which means we have caught up with previous generation
+                            // Technically it's possible that we have dequeuers in progress and spaces are or about to be available. 
+                            // We still would be better off with a new segment.
+                            return false;
                         }
 
-                        missedSteal = true;
+                        // Lost a race. Spin a bit, then try again.
+                        spinner.SpinOnce();
+                    }
+                }
+
+                /// <summary>Tries to dequeue an element from the queue.</summary>
+                public IThreadPoolWorkItem TryDequeue()
+                {
+                    // Loop in case of contention...
+                    var spinner = new SpinWait();
+
+                    for (; ; )
+                    {
+                        var slots = _slots;
+                        var slotsMask = _slotsMask;
+
+                        // Get the dequeue position.
+                        // must read before SequenceNumber. 
+                        // If we see old SequenceNumber, we might see the segment as empty and lose items
+                        int position = Volatile.Read(ref _queueEnds.Dequeue);
+                        ref var slot = ref slots[position & slotsMask];
+
+                        // we most likley will need this. Compute here while fetching slot stuff.
+                        var nextGenPosition = position + slots.Length;
+
+                        // Read the sequence number for the tail position.
+                        int sequenceNumber = slot.SequenceNumber;
+
+                        // Check if the slot is considered Full in the current generation.
+                        int expected = position + Full;
+                        int diff = sequenceNumber - expected;
+                        if (diff == 0)
+                        {
+                            // Reserve the slot for Dequeuing.
+                            //
+                            // WARNING:
+                            // The next few lines are not reliable on a runtime that
+                            // supports thread aborts. If a thread abort were to sneak in after the CompareExchange
+                            // but before the write to SequenceNumber, anyone trying to modify this slot would
+                            // spin indefinitely.  If this implementation is ever used on such a platform, this
+                            // if block should be wrapped in a finally / prepared region.
+                            if (Interlocked.CompareExchange(ref slot.SequenceNumber, nextGenPosition + Changing, expected) == expected)
+                            {
+                                // Successfully reserved the slot.  Note that after the above CompareExchange, other threads
+                                // trying to return will end up spinning until we do the subsequent Write.
+
+                                // only one thread gets to increment a given value of Dequeue (since it needs to lock the slot), 
+                                // so this "+" does not need to be interlocked.
+                                _queueEnds.Dequeue = position + 1;
+
+                                var item = slot.Item;
+                                slot.Item = null;
+                                // make the slot appear empty in the next generation
+                                Volatile.Write(ref slot.SequenceNumber, nextGenPosition + Empty);
+
+                                if (item == null)
+                                {
+                                    // the item was removed or popped, so we have nothing to return. 
+                                    // this is not a race though. just continue.
+                                    continue;
+                                }
+                                return item;
+                            }
+                        }
+                        else if (diff < 0)
+                        {
+                            // The sequence number was less than empty, which means the element is not avaialable yet.
+                            // at this point in time the segment was empty.
+                            return null;
+                        }
+
+                        // Lost a race. Spin a bit, then try again.
+                        spinner.SpinOnce();
+                    }
+                }
+
+                public bool TryPush(IThreadPoolWorkItem item, int pushIndex)
+                {
+                    // Push index is a guess. 
+                    // if we fail to push, we just will have to enqueue
+                    ref var slot = ref this._slots[pushIndex & this._slotsMask];
+                    var expected = pushIndex + Full;
+
+                    if (slot.SequenceNumber == expected)
+                    {
+                        // Reserve the slot.
+                        // Failure to do so, means that someone else might be changing the value.
+                        //
+                        // WARNING:
+                        // The next few lines are not reliable on a runtime that
+                        // supports thread aborts. If a thread abort were to sneak in after the CompareExchange
+                        // but before the write to SequenceNumber, anyone trying to dequeue from this slot would
+                        // spin indefinitely.  If this implementation is ever used on such a platform, this
+                        // if block should be wrapped in a finally / prepared region.
+                        if (Interlocked.CompareExchange(ref slot.SequenceNumber, expected + Changing, expected) == expected)
+                        {
+                            if (slot.Item == null)
+                            {
+                                slot.Item = item;
+                                Volatile.Write(ref slot.SequenceNumber, expected);
+
+                                this._queueEnds.Push = pushIndex + 1;
+                                return true;
+                            }
+
+                            // relatively rare case - lost race to a push or enqueue
+                            // typically these all run on the same thread/core
+                            slot.SequenceNumber = expected;
+                        }
+                    }
+
+                    return false;
+                }
+
+                internal IThreadPoolWorkItem TryPop()
+                {
+                    // Push index is a guess. 
+                    var popIndex = this._queueEnds.Push - 1;
+
+                    ref var slot = ref this._slots[popIndex & this._slotsMask];
+                    var expected = popIndex + Full;
+                    if (slot.SequenceNumber == expected)
+                    {
+                        // Reserve the slot.
+                        // Failure to do so, means that someone else might be changing the value.
+                        //
+                        // WARNING:
+                        // The next few lines are not reliable on a runtime that
+                        // supports thread aborts. If a thread abort were to sneak in after the CompareExchange
+                        // but before the write to SequenceNumber, anyone trying to dequeue from this slot would
+                        // spin indefinitely.  If this implementation is ever used on such a platform, this
+                        // if block should be wrapped in a finally / prepared region.
+                        if (Interlocked.CompareExchange(ref slot.SequenceNumber, expected + Changing, expected) == expected)
+                        {
+                            var item = slot.Item;
+                            slot.Item = null;
+                            Volatile.Write(ref slot.SequenceNumber, expected);
+
+                            this._queueEnds.Push = popIndex;
+                            return item;
+                        }
                     }
 
                     return null;
                 }
+
+                internal bool TryRemove(IThreadPoolWorkItem callback)
+                {
+                    var lookupIndex = this._queueEnds.Push - 1;
+                    var slots = this._slots;
+                    var mask = this._slotsMask;
+
+                    for (int limit = lookupIndex - removeRange; lookupIndex != limit; lookupIndex--)
+                    {
+                        ref var slot = ref slots[lookupIndex & mask];
+
+                        if (slot.Item == callback)
+                        {
+                            // Reserve the slot for removing.
+                            // Failure to do so, means that someone else might be removing the value.
+                            //
+                            // WARNING:
+                            // The next few lines are not reliable on a runtime that
+                            // supports thread aborts. If a thread abort were to sneak in after the CompareExchange
+                            // but before the write to SequenceNumber, anyone trying to dequeue from this slot would
+                            // spin indefinitely.  If this implementation is ever used on such a platform, this
+                            // if block should be wrapped in a finally / prepared region.
+                            var expected = lookupIndex + Full;
+                            if (Interlocked.CompareExchange(ref slot.SequenceNumber, expected + Changing, expected) == expected)
+                            {
+                                if (slot.Item == callback)
+                                {
+                                    slot.Item = null;
+                                    Volatile.Write(ref slot.SequenceNumber, expected);
+                                    return true;
+                                }
+
+                                slot.SequenceNumber = expected;
+                            }
+
+                            // lost it.
+                            break;
+                        }
+                        else if (slot.SequenceNumber - lookupIndex > (Changing + Full))
+                        {
+                            // slot is in the new generation. we have reached the dequeuers end.
+                            break;
+                        }
+                    }
+
+                    return false;
+                }
+
+                /// <summary>Represents a slot in the queue.</summary>
+                [StructLayout(LayoutKind.Explicit)]
+                [DebuggerDisplay("Item = {Item}, SequenceNumber = {SequenceNumber}")]
+                internal struct Slot
+                {
+                    /// <summary>The sequence number for this slot, used to synchronize between enqueuers and dequeuers.</summary>
+                    [FieldOffset(0)] public int SequenceNumber;
+                    /// <summary>The item.</summary>
+                    [FieldOffset(8)] public IThreadPoolWorkItem Item;
+                }
+            }
+            /// <summary>Padded head and tail indices, to avoid false sharing between producers and consumers.</summary>
+            [DebuggerDisplay("Head = {Head}, Tail = {Tail}")]
+            [StructLayout(LayoutKind.Explicit, Size = 3 * Internal.PaddingHelpers.CACHE_LINE_SIZE + 8)] // padding before/between/after fields
+            internal struct PaddedHeadAndTail
+            {
+                [FieldOffset(1 * Internal.PaddingHelpers.CACHE_LINE_SIZE)] public int Dequeue;
+                [FieldOffset(2 * Internal.PaddingHelpers.CACHE_LINE_SIZE)] public int Enqueue;
+                // natural offset from Push. Push and Enqueue are generally used on the same thread
+                [FieldOffset(2 * Internal.PaddingHelpers.CACHE_LINE_SIZE + 4)] public int Push;
             }
         }
 
+        internal WorkStealingQueue[] localQueues;
+        internal readonly WorkStealingQueue workItems = new WorkStealingQueue();
+//        internal readonly ConcurrentQueue<IThreadPoolWorkItem> workItems = new ConcurrentQueue<IThreadPoolWorkItem>();
         internal bool loggingEnabled;
-        internal readonly ConcurrentQueue<IThreadPoolWorkItem> workItems = new ConcurrentQueue<IThreadPoolWorkItem>();
 
         private Internal.PaddingFor32 pad1;
 
-        private volatile int numOutstandingThreadRequests = 0;
+        private int numOutstandingThreadRequests = 0;
 
         private Internal.PaddingFor32 pad2;
 
-        public ThreadPoolWorkQueue()
+        internal ThreadPoolWorkQueue()
         {
-            loggingEnabled = FrameworkEventSource.Log.IsEnabled(EventLevel.Verbose, FrameworkEventSource.Keywords.ThreadPool | FrameworkEventSource.Keywords.ThreadTransfer);
+            //TODO: VS uncomment
+            //loggingEnabled = FrameworkEventSource.Log.IsEnabled(EventLevel.Verbose, FrameworkEventSource.Keywords.ThreadPool | FrameworkEventSource.Keywords.ThreadTransfer);
+
+            var localQueues = new WorkStealingQueue[RoundUpToPowerOf2(ThreadPoolGlobals.processorCount)];
+            for (int i = 0; i < ThreadPoolGlobals.processorCount; i++)
+            {
+                localQueues[i] = new WorkStealingQueue();
+            }
+
+            this.localQueues = localQueues;
         }
 
-        public ThreadPoolWorkQueueThreadLocals EnsureCurrentThreadHasQueue() =>
-            ThreadPoolWorkQueueThreadLocals.threadLocals ??
-            (ThreadPoolWorkQueueThreadLocals.threadLocals = new ThreadPoolWorkQueueThreadLocals(this));
+        /// <summary>
+        /// Round the specified value up to the next power of 2, if it isn't one already.
+        /// </summary>
+        private static int RoundUpToPowerOf2(int i)
+        {
+            // Based on https://graphics.stanford.edu/~seander/bithacks.html#RoundUpPowerOf2
+            --i;
+            i |= i >> 1;
+            i |= i >> 2;
+            i |= i >> 4;
+            i |= i >> 8;
+            i |= i >> 16;
+            return i + 1;
+        }
+
+        /// <summary>
+        /// Returns a local queue softly affinitized with the current thread.
+        /// </summary>
+        internal WorkStealingQueue GetLocalQueue()
+        {
+            return localQueues[GetLocalQueueIndex()];
+        }
+
+        internal int GetLocalQueueIndex()
+        {
+            return (Threading.Thread.GetCurrentProcessorId() - 100) % ThreadPoolGlobals.processorCount;
+        }
 
         internal void EnsureThreadRequested()
         {
@@ -440,13 +728,9 @@ namespace System.Threading
             if (loggingEnabled)
                 System.Diagnostics.Tracing.FrameworkEventSource.Log.ThreadPoolEnqueueWorkObject(callback);
 
-            ThreadPoolWorkQueueThreadLocals tl = null;
             if (!forceGlobal)
-                tl = ThreadPoolWorkQueueThreadLocals.threadLocals;
-
-            if (null != tl)
             {
-                tl.workStealingQueue.LocalPush(callback);
+                GetLocalQueue().PushOrEnqueue(callback);
             }
             else
             {
@@ -458,37 +742,38 @@ namespace System.Threading
 
         internal bool LocalFindAndPop(IThreadPoolWorkItem callback)
         {
-            ThreadPoolWorkQueueThreadLocals tl = ThreadPoolWorkQueueThreadLocals.threadLocals;
-            return tl != null && tl.workStealingQueue.LocalFindAndPop(callback);
+            return GetLocalQueue().LocalFindAndPop(callback); ;
         }
 
-        public IThreadPoolWorkItem Dequeue(ThreadPoolWorkQueueThreadLocals tl, ref bool missedSteal)
+        public IThreadPoolWorkItem Dequeue()
         {
-            WorkStealingQueue localWsq = tl.workStealingQueue;
-            IThreadPoolWorkItem callback;
 
-            if ((callback = localWsq.LocalPop()) == null && // first try the local queue
-                !workItems.TryDequeue(out callback)) // then try the global queue
+            WorkStealingQueue[] queues = localQueues;
+            var localQueueIndex = GetLocalQueueIndex();
+            WorkStealingQueue localWsq = queues[localQueueIndex];
+
+            // first try the local queue
+            // then try the global queue
+            IThreadPoolWorkItem callback = localWsq.Pop() ??
+                                           workItems.Dequeue();
+
+            //IThreadPoolWorkItem callback = localWsq.Pop();
+            if (callback == null) // && !workItems.TryDequeue(out callback))
             {
-                // finally try to steal from another thread's local queue
-                WorkStealingQueue[] queues = WorkStealingQueueList.Queues;
-                int c = queues.Length;
-                Debug.Assert(c > 0, "There must at least be a queue for this thread.");
-                int maxIndex = c - 1;
-                int i = tl.random.Next(c);
-                while (c > 0)
+                // finally try to steal from all local queues
+                // Traverse all local queues starting with those that differ in lower bits and going gradually up.
+                // This way we want to minimize that two threads concurrently go through the same sequence of queues.
+                for (int i = 0, l = queues.Length; i < l; i++)
                 {
-                    i = (i < maxIndex) ? i + 1 : 0;
-                    WorkStealingQueue otherQueue = queues[i];
-                    if (otherQueue != localWsq && otherQueue.CanSteal)
+                    localWsq = queues[localQueueIndex ^ i];
+                    if (localWsq != null && localWsq.CanSteal)
                     {
-                        callback = otherQueue.TrySteal(ref missedSteal);
+                        callback = localWsq.Dequeue();
                         if (callback != null)
                         {
                             break;
                         }
                     }
-                    c--;
                 }
             }
 
@@ -515,7 +800,8 @@ namespace System.Threading
             workQueue.MarkThreadRequestSatisfied();
 
             // Has the desire for logging changed since the last time we entered?
-            workQueue.loggingEnabled = FrameworkEventSource.Log.IsEnabled(EventLevel.Verbose, FrameworkEventSource.Keywords.ThreadPool | FrameworkEventSource.Keywords.ThreadTransfer);
+            //TODO: VS uncomment
+            // workQueue.loggingEnabled = FrameworkEventSource.Log.IsEnabled(EventLevel.Verbose, FrameworkEventSource.Keywords.ThreadPool | FrameworkEventSource.Keywords.ThreadTransfer);
 
             //
             // Assume that we're going to need another thread if this one returns to the VM.  We'll set this to 
@@ -526,29 +812,18 @@ namespace System.Threading
             try
             {
                 //
-                // Set up our thread-local data
-                //
-                ThreadPoolWorkQueueThreadLocals tl = workQueue.EnsureCurrentThreadHasQueue();
-
-                //
                 // Loop until our quantum expires.
                 //
-                while ((Environment.TickCount - quantumStartTime) < ThreadPoolGlobals.TP_QUANTUM)
+                do
                 {
-                    bool missedSteal = false;
-                    workItem = workQueue.Dequeue(tl, ref missedSteal);
+                    workItem = workQueue.Dequeue();
 
                     if (workItem == null)
                     {
                         //
-                        // No work.  We're going to return to the VM once we leave this protected region.
-                        // If we missed a steal, though, there may be more work in the queue.
-                        // Instead of looping around and trying again, we'll just request another thread.  This way
-                        // we won't starve other AppDomains while we spin trying to get locks, and hopefully the thread
-                        // that owns the contended work-stealing queue will pick up its own workitems in the meantime, 
-                        // which will be more efficient than this thread doing it anyway.
+                        // No work.
                         //
-                        needAnotherThread = missedSteal;
+                        needAnotherThread = false;
 
                         // Tell the VM we're returning normally, not because Hill Climbing asked us to return.
                         return true;
@@ -561,7 +836,9 @@ namespace System.Threading
                     // If we found work, there may be more work.  Ask for another thread so that the other work can be processed
                     // in parallel.  Note that this will only ask for a max of #procs threads, so it's safe to call it for every dequeue.
                     //
-                    workQueue.EnsureThreadRequested();
+
+                    // TODO: VS do we need this? Is this in case N workers lock in tasks?
+                    // workQueue.EnsureThreadRequested();
 
                     //
                     // Execute the workitem outside of any finally blocks, so that it can be aborted if needed.
@@ -594,6 +871,7 @@ namespace System.Threading
                     if (!ThreadPool.NotifyWorkItemComplete())
                         return false;
                 }
+                while ((Environment.TickCount - quantumStartTime) < ThreadPoolGlobals.TP_QUANTUM);
 
                 // If we get here, it's because our quantum expired.  Tell the VM we're returning normally.
                 return true;
@@ -627,78 +905,6 @@ namespace System.Threading
             // we can never reach this point, but the C# compiler doesn't know that, because it doesn't know the ThreadAbortException will be reraised above.
             Debug.Fail("Should never reach this point");
             return true;
-        }
-    }
-
-    // Simple random number generator. We don't need great randomness, we just need a little and for it to be fast.
-    internal struct FastRandom // xorshift prng
-    {
-        private uint _w, _x, _y, _z;
-
-        public FastRandom(int seed)
-        {
-            _x = (uint)seed;
-            _w = 88675123;
-            _y = 362436069;
-            _z = 521288629;
-        }
-
-        public int Next(int maxValue)
-        {
-            Debug.Assert(maxValue > 0);
-
-            uint t = _x ^ (_x << 11);
-            _x = _y; _y = _z; _z = _w;
-            _w = _w ^ (_w >> 19) ^ (t ^ (t >> 8));
-
-            return (int)(_w % (uint)maxValue);
-        }
-    }
-
-    // Holds a WorkStealingQueue, and removes it from the list when this object is no longer referenced.
-    internal sealed class ThreadPoolWorkQueueThreadLocals
-    {
-        [ThreadStatic]
-        public static ThreadPoolWorkQueueThreadLocals threadLocals;
-
-        public readonly ThreadPoolWorkQueue workQueue;
-        public readonly ThreadPoolWorkQueue.WorkStealingQueue workStealingQueue;
-        public FastRandom random = new FastRandom(Thread.CurrentThread.ManagedThreadId); // mutable struct, do not copy or make readonly
-
-        public ThreadPoolWorkQueueThreadLocals(ThreadPoolWorkQueue tpq)
-        {
-            workQueue = tpq;
-            workStealingQueue = new ThreadPoolWorkQueue.WorkStealingQueue();
-            ThreadPoolWorkQueue.WorkStealingQueueList.Add(workStealingQueue);
-        }
-
-        private void CleanUp()
-        {
-            if (null != workStealingQueue)
-            {
-                if (null != workQueue)
-                {
-                    IThreadPoolWorkItem cb;
-                    while ((cb = workStealingQueue.LocalPop()) != null)
-                    {
-                        Debug.Assert(null != cb);
-                        workQueue.Enqueue(cb, forceGlobal: true);
-                    }
-                }
-
-                ThreadPoolWorkQueue.WorkStealingQueueList.Remove(workStealingQueue);
-            }
-        }
-
-        ~ThreadPoolWorkQueueThreadLocals()
-        {
-            // Since the purpose of calling CleanUp is to transfer any pending workitems into the global
-            // queue so that they will be executed by another thread, there's no point in doing this cleanup
-            // if we're in the process of shutting down or unloading the AD.  In those cases, the work won't
-            // execute anyway.  And there are subtle race conditions involved there that would lead us to do the wrong
-            // thing anyway.  So we'll only clean up if this is a "normal" finalization.
-            if (!(Environment.HasShutdownStarted || AppDomain.CurrentDomain.IsFinalizingForUnload()))
-                CleanUp();
         }
     }
 
@@ -1368,21 +1574,22 @@ namespace System.Threading
         // Get all workitems.  Called by TaskScheduler in its debugger hooks.
         internal static IEnumerable<IThreadPoolWorkItem> GetQueuedWorkItems()
         {
+            var workQueue = ThreadPoolGlobals.workQueue;
+
             // Enumerate global queue
-            foreach (IThreadPoolWorkItem workItem in ThreadPoolGlobals.workQueue.workItems)
-            {
-                yield return workItem;
-            }
+            //foreach (IThreadPoolWorkItem workItem in workQueue.workItems)
+            //{
+            //    yield return workItem;
+            //}
 
             // Enumerate each local queue
-            foreach (ThreadPoolWorkQueue.WorkStealingQueue wsq in ThreadPoolWorkQueue.WorkStealingQueueList.Queues)
+            foreach (ThreadPoolWorkQueue.WorkStealingQueue wsq in workQueue.localQueues)
             {
-                if (wsq != null && wsq.m_array != null)
+                for (var head = wsq._deqSegment; head != null; head = head._nextSegment)
                 {
-                    IThreadPoolWorkItem[] items = wsq.m_array;
-                    for (int i = 0; i < items.Length; i++)
+                    foreach (var slot in head._slots)
                     {
-                        IThreadPoolWorkItem item = items[i];
+                        IThreadPoolWorkItem item = slot.Item;
                         if (item != null)
                         {
                             yield return item;
@@ -1394,20 +1601,21 @@ namespace System.Threading
 
         internal static IEnumerable<IThreadPoolWorkItem> GetLocallyQueuedWorkItems()
         {
-            ThreadPoolWorkQueue.WorkStealingQueue wsq = ThreadPoolWorkQueueThreadLocals.threadLocals.workStealingQueue;
-            if (wsq != null && wsq.m_array != null)
+            ThreadPoolWorkQueue.WorkStealingQueue wsq = ThreadPoolGlobals.workQueue.GetLocalQueue();
+            for (var head = wsq._deqSegment; head != null; head = head._nextSegment)
             {
-                IThreadPoolWorkItem[] items = wsq.m_array;
-                for (int i = 0; i < items.Length; i++)
+                foreach (var slot in head._slots)
                 {
-                    IThreadPoolWorkItem item = items[i];
+                    IThreadPoolWorkItem item = slot.Item;
                     if (item != null)
+                    {
                         yield return item;
+                    }
                 }
             }
         }
 
-        internal static IEnumerable<IThreadPoolWorkItem> GetGloballyQueuedWorkItems() => ThreadPoolGlobals.workQueue.workItems;
+        internal static IEnumerable<IThreadPoolWorkItem> GetGloballyQueuedWorkItems() => GetQueuedWorkItems(); // ThreadPoolGlobals.workQueue.workItems;
 
         private static object[] ToObjectArray(IEnumerable<IThreadPoolWorkItem> workitems)
         {
