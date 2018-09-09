@@ -653,14 +653,14 @@ namespace System.Threading
             if (loggingEnabled)
                 System.Diagnostics.Tracing.FrameworkEventSource.Log.ThreadPoolEnqueueWorkObject(callback);
 
-            //if (!forceGlobal)
+            if (!forceGlobal)
             {
                 GetLocalQueue().Enqueue(callback);
             }
-            //else
-            //{
-            //    workItems.Enqueue(callback);
-            //}
+            else
+            {
+                workItems.Enqueue(callback);
+            }
 
             EnsureThreadRequested();
         }
