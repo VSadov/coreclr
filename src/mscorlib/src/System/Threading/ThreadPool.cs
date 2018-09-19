@@ -406,7 +406,7 @@ namespace System.Threading
                         }
 
                         // Lost a race. Spin a bit, then try again.
-                        spinner.SpinOnce();
+                        spinner.SpinOnce(int.MaxValue);
                     }
                 }
 
@@ -416,7 +416,7 @@ namespace System.Threading
                     // Loop in case of contention...
                     var spinner = new SpinWait();
 
-                    for(; ;)
+                    for (; ; )
                     {
                         var slots = _slots;
                         int generationShift = slots.Length;
@@ -451,7 +451,7 @@ namespace System.Threading
                                 var item = slot.Item;
                                 if (item != null)
                                 {
-                                   item = Interlocked.Exchange(ref slot.Item, null);
+                                    item = Interlocked.Exchange(ref slot.Item, null);
                                 }
 
                                 // make the slot appear empty in the next generation
@@ -585,13 +585,7 @@ namespace System.Threading
             //TODO: VS uncomment
             //loggingEnabled = FrameworkEventSource.Log.IsEnabled(EventLevel.Verbose, FrameworkEventSource.Keywords.ThreadPool | FrameworkEventSource.Keywords.ThreadTransfer);
 
-            var localQueues = new WorkStealingQueue[RoundUpToPowerOf2(ThreadPoolGlobals.processorCount)];
-            for (int i = 0; i < ThreadPoolGlobals.processorCount; i++)
-            {
-                localQueues[i] = new WorkStealingQueue();
-            }
-
-            this.localQueues = localQueues;
+            localQueues = new WorkStealingQueue[RoundUpToPowerOf2(ThreadPoolGlobals.processorCount)];
         }
 
         /// <summary>
@@ -617,9 +611,25 @@ namespace System.Threading
             return localQueues[GetLocalQueueIndex()];
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal WorkStealingQueue GetOrAddLocalQueue()
+        {
+            var index = GetLocalQueueIndex();
+            var result = localQueues[index];
+
+            if (result == null)
+            {
+                var newQueue = new WorkStealingQueue();
+                Interlocked.CompareExchange(ref localQueues[index], newQueue, null);
+                result = localQueues[index];
+            }
+
+            return result;
+        }
+
         internal int GetLocalQueueIndex()
         {
-            return (Threading.Thread.GetCurrentProcessorId() - 100) % ThreadPoolGlobals.processorCount;
+            return (Threading.Thread.GetCurrentProcessorId() - 100) & (localQueues.Length - 1);
         }
 
         internal void EnsureThreadRequested()
@@ -669,7 +679,8 @@ namespace System.Threading
             if (loggingEnabled)
                 System.Diagnostics.Tracing.FrameworkEventSource.Log.ThreadPoolEnqueueWorkObject(callback);
 
-            var queue = forceGlobal ? globalQueue : GetLocalQueue();
+            var queue = forceGlobal ? globalQueue : GetOrAddLocalQueue();
+            //var queue = globalQueue;
             queue.Enqueue(callback);
 
             EnsureThreadRequested();
@@ -677,26 +688,23 @@ namespace System.Threading
 
         internal bool LocalFindAndPop(IThreadPoolWorkItem callback)
         {
-            return GetLocalQueue().LocalFindAndPop(callback); ;
+            return GetLocalQueue()?.LocalFindAndPop(callback) == true;
         }
 
-        public IThreadPoolWorkItem Dequeue(ref WorkStealingQueue last)
+        public IThreadPoolWorkItem Dequeue()
         {
             WorkStealingQueue[] queues = localQueues;
             var localQueueIndex = GetLocalQueueIndex();
             WorkStealingQueue localWsq = queues[localQueueIndex];
 
             // first try popping from the local queue
-            IThreadPoolWorkItem callback = localWsq.TryPop();
-            if (callback != null)
-            {
-                goto done;
-            }
+            IThreadPoolWorkItem callback = localWsq?.TryPop();
 
-            // then try the queue from which we stole last time, hopefully it has more.
-            // checking queues is an expense that could be noticeable when there are lots of queues.
-            // `CanSteal` touches both ends of the queue, try avoiding that.
-            callback = last.Dequeue();
+            // then try the global queue
+            if (callback == null && globalQueue.CanSteal)
+            {
+                callback = globalQueue.Dequeue();
+            }
 
             if (callback == null)
             {
@@ -711,17 +719,12 @@ namespace System.Threading
                         callback = localWsq.Dequeue();
                         if (callback != null)
                         {
-                            last = localWsq;
-                            goto done;
+                            break;
                         }
                     }
                 }
-
-                // before claiming that there is no work. Check the global queue to be sure.
-                callback = (last = globalQueue).Dequeue();
             }
 
-        done:
             return callback;
         }
 
@@ -759,10 +762,9 @@ namespace System.Threading
                 //
                 // Loop until our quantum expires.
                 //
-                WorkStealingQueue lastStolenFrom = workQueue.globalQueue;
                 do
                 {
-                    workItem = workQueue.Dequeue(ref lastStolenFrom);
+                    workItem = workQueue.Dequeue();
 
                     if (workItem == null)
                     {
@@ -1547,7 +1549,7 @@ namespace System.Threading
 
         internal static IEnumerable<IThreadPoolWorkItem> GetLocallyQueuedWorkItems()
         {
-            ThreadPoolWorkQueue.WorkStealingQueue wsq = ThreadPoolGlobals.workQueue.GetLocalQueue();
+            ThreadPoolWorkQueue.WorkStealingQueue wsq = ThreadPoolGlobals.workQueue?.GetLocalQueue();
             for (var head = wsq._deqSegment; head != null; head = head._nextSegment)
             {
                 foreach (var slot in head._slots)
