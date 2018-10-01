@@ -20,6 +20,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.ConstrainedExecution;
 using System.Runtime.InteropServices;
 using System.Security;
+using Internal.Runtime.Augments;
 using Microsoft.Win32;
 
 //TODO: VS remove
@@ -86,11 +87,15 @@ namespace System.Threading
             /// <summary>The current dequeue segment.</summary>
             internal WorkStealingQueueSegment _deqSegment;
 
+            // TODO: VS used for debugging. may remove later.
+            internal int _ID;
+
             /// <summary>
             /// Initializes a new instance of the <see cref="WorkStealingQueue"/> class.
             /// </summary>
-            public WorkStealingQueue()
+            public WorkStealingQueue(int ID)
             {
+                _ID = ID;
                 _crossSegmentLock = new object();
                 _enqSegment = _deqSegment = new WorkStealingQueueSegment(InitialSegmentLength);
             }
@@ -356,9 +361,6 @@ namespace System.Threading
                 /// </summary>
                 public bool TryEnqueue(IThreadPoolWorkItem item)
                 {
-                    // Loop in case of contention...
-                    var spinner = new SpinWait();
-
                     for (; ; )
                     {
                         var slots = _slots;
@@ -406,7 +408,7 @@ namespace System.Threading
                         }
 
                         // Lost a race. Spin a bit, then try again.
-                        spinner.SpinOnce(int.MaxValue);
+                        Thread.SpinWait(1);
                     }
                 }
 
@@ -416,7 +418,7 @@ namespace System.Threading
                     // Loop in case of contention...
                     var spinner = new SpinWait();
 
-                    for (; ; )
+                    for (;;)
                     {
                         var slots = _slots;
                         int generationShift = slots.Length;
@@ -472,7 +474,9 @@ namespace System.Threading
                         }
 
                         // Lost a race. Spin a bit, then try again.
-                        spinner.SpinOnce();
+                         spinner.SpinOnce();
+
+                        //Thread.SpinWait(24);
                     }
                 }
 
@@ -572,7 +576,7 @@ namespace System.Threading
         }
 
         internal WorkStealingQueue[] localQueues;
-        internal readonly WorkStealingQueue globalQueue = new WorkStealingQueue();
+        internal readonly WorkStealingQueue globalQueue = new WorkStealingQueue(-1);
 //        internal readonly ConcurrentQueue<IThreadPoolWorkItem> workItems = new ConcurrentQueue<IThreadPoolWorkItem>();
         internal bool loggingEnabled;
 
@@ -619,7 +623,7 @@ namespace System.Threading
 
             if (result == null)
             {
-                var newQueue = new WorkStealingQueue();
+                var newQueue = new WorkStealingQueue(index);
                 Interlocked.CompareExchange(ref localQueues[index], newQueue, null);
                 result = localQueues[index];
             }
@@ -691,7 +695,7 @@ namespace System.Threading
             return GetLocalQueue()?.LocalFindAndPop(callback) == true;
         }
 
-        public IThreadPoolWorkItem Dequeue()
+        public IThreadPoolWorkItem Dequeue(ref bool missedSteal)
         {
             WorkStealingQueue[] queues = localQueues;
             var localQueueIndex = GetLocalQueueIndex();
@@ -708,6 +712,8 @@ namespace System.Threading
 
             if (callback == null)
             {
+                missedSteal |= globalQueue.CanSteal;
+
                 // finally try stealing from all local queues
                 // Traverse all local queues starting with those that differ in lower bits and going gradually up.
                 // This way we want to minimize chances that two threads concurrently go through the same sequence of queues.
@@ -721,6 +727,7 @@ namespace System.Threading
                         {
                             break;
                         }
+                        missedSteal = missedSteal || localWsq.CanSteal;
                     }
                 }
             }
@@ -764,14 +771,15 @@ namespace System.Threading
                 //
                 do
                 {
-                    workItem = workQueue.Dequeue();
+                    bool missedSteal = false;
+                    workItem = workQueue.Dequeue(ref missedSteal);
 
                     if (workItem == null)
                     {
                         //
                         // No work.
                         //
-                        needAnotherThread = false;
+                        needAnotherThread = missedSteal;
 
                         // Tell the VM we're returning normally, not because Hill Climbing asked us to return.
                         return true;
