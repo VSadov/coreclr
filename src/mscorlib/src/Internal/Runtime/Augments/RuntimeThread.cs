@@ -240,7 +240,7 @@ namespace Internal.Runtime.Augments
         private const int ProcessorIdCacheCountDownMask = (1 << ProcessorIdCacheShift) - 1;
         private const int ProcessorIdRefreshRate = 5000;
 
-        private static int RefreshCurrentProcessorId()
+        internal static int RefreshCurrentProcessorId()
         {
             int currentProcessorId = GetCurrentProcessorNumber();
 
