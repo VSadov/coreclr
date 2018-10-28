@@ -324,11 +324,12 @@ namespace System.Threading
                 {
                     // Loop in case of contention...
                     var spinner = new SpinWait();
-                    var slots = _slots;
-                    var slotsMask = _slotsMask;
 
                     for (; ; )
                     {
+                        var slots = _slots;
+                        var slotsMask = _slotsMask;
+
                         // IMPORTANT: hot path. 
                         //            get from fetching Equeue to the following CmpExch as fast as possible. 
                         //            Lest we will clash with other enqueuers (only an issue when this is a global queue).
@@ -337,12 +338,13 @@ namespace System.Threading
 
                         int prevSequenceNumber = prevSlot.SequenceNumber;
 
-                        // retry if prev slot is not full or empty in the next generation
-                        if (prevSequenceNumber == position | prevSequenceNumber == position + slotsMask)
+                        // check if prev slot is empty in the next generation or full
+                        // otherwise retry - we have some kind of race, most likely the prev item is being dequeued
+                        if (prevSequenceNumber == position + slotsMask || prevSequenceNumber == position)
                         {
                             if (Interlocked.CompareExchange(ref prevSlot.SequenceNumber, prevSequenceNumber + Change, prevSequenceNumber) == prevSequenceNumber)
                             {
-                                // Successfully reserved prev slot.
+                                // Successfully locked prev slot.
                                 // Read the sequence number for the enqueue position.
                                 ref Slot slot = ref GetSlot(slots, slotsMask, position);
                                 int sequenceNumber = Volatile.Read(ref slot.SequenceNumber);
@@ -353,31 +355,32 @@ namespace System.Threading
                                 {
                                     slot.Item = item;
 
-                                    // mark slot as full 
-                                    // this enables the slot for dequeuing
-                                    // NB: volatile since must be after the item store
-                                    Volatile.Write(ref slot.SequenceNumber, position + Full);
-
                                     // advance enq
                                     // NB: not interlocked since we have locked the slot
                                     _queueEnds.Enqueue = position + 1;
+
+                                    // mark slot as full 
+                                    // this enables the slot for dequeuing
+                                    // NB: volatile since we need a fence after item and Enqueue stores
+                                    Volatile.Write(ref slot.SequenceNumber, position + Full);
 
                                     // unlock prev slot, we are done
                                     prevSlot.SequenceNumber = prevSequenceNumber;
                                     return true;
                                 }
 
-                                // unlock prev slot
-                                prevSlot.SequenceNumber = prevSequenceNumber;
-
                                 if (position - sequenceNumber > 0)
                                 {
                                     // The sequence number was less than what we needed, which means we have caught up with previous generation
                                     // Technically it's possible that we have dequeuers in progress and spaces are or about to be available. 
                                     // We still would be better off with a new segment.
+                                    // NB: need a fence after Enqueue store.
                                     _queueEnds.Enqueue = position + FreezeOffset;
-                                    _frozenForEnqueues = true;
+                                    Volatile.Write(ref _frozenForEnqueues, true);
                                 }
+
+                                // unlock prev slot
+                                prevSlot.SequenceNumber = prevSequenceNumber;
                             }
                         }
 
@@ -462,17 +465,18 @@ namespace System.Threading
                 {
                     // Loop in case of contention...
                     var spinner = new SpinWait();
-                    var slots = _slots;
-                    var slotsMask = _slotsMask;
 
                     for (; ; )
                     {
+                        // we may need this later. Read it now.
+                        var generationGap = _slots.Length;
+
                         // Get the dequeue position.
                         // IMPORTANT: hot path. 
-                        //            get from fetching Dequeue to the following CmpExch as fast as possible. 
-                        //            Lest we will clash with other dequers.
+                        //            get from fetching Dequeue to the following Volatile.Write as fast as possible. 
+                        //            Lest we will clash with others.
                         int position = _queueEnds.Dequeue;
-                        ref Slot slot = ref GetSlot(slots, slotsMask, position);
+                        ref Slot slot = ref GetSlot(_slots, _slotsMask, position);
 
                         // Read the sequence number for the cell.
                         int sequenceNumber = slot.SequenceNumber;
@@ -495,13 +499,13 @@ namespace System.Threading
                                 // we are committed to dequeue it
 
                                 // NB: not interlocked since we have locked the slot
-                                // doing this first so that dequers would start using next slot. this one is ours
+                                // doing this first so that dequers would start using the next slot. this one is ours
                                 _queueEnds.Dequeue = position + 1;
-
                                 var item = slot.Item;
 
                                 // make the slot appear empty in the next generation
-                                Volatile.Write(ref slot.SequenceNumber, position + slots.Length);
+                                // unlocks the slot for enqueuing
+                                Volatile.Write(ref slot.SequenceNumber, position + generationGap);
 
                                 if (item == null)
                                 {
@@ -513,18 +517,13 @@ namespace System.Threading
                                 return item;
                             }
                         }
-                        else if (sequenceNumber < position + Full) // queue is empty
-                        {
-                            return null;
-                        }
-
-                        // Lost a race. Spin a bit, then try again.
-                        // if (spinner.NextSpinWillYield && !forceSpin)
-                        if (!forceSpin)
+                        else if (!forceSpin || sequenceNumber < position + Full) // queue is empty
                         {
                             break;
                         }
 
+                        // Lost a race, but must ensure the queue is empty before giving up. 
+                        // Spin a bit, then try again.
                         spinner.SpinOnce();
                     }
 
