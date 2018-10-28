@@ -667,8 +667,30 @@ namespace System.Threading
         {
             return (Threading.Thread.GetCurrentProcessorId() - 100) & (localQueues.Length - 1);
         }
-
+        
         internal void EnsureThreadRequested()
+        {
+            //
+            // If we have not yet requested #procs threads from the VM, then request a new thread
+            // as needed
+            //
+            // Note that there is a separate count in the VM which will also be incremented in this case, 
+            // which is handled by RequestWorkerThread.
+            //
+            int count = numOutstandingThreadRequests;
+            while (count == 0)
+            {
+                int prev = Interlocked.CompareExchange(ref numOutstandingThreadRequests, 1, 0);
+                if (prev == count)
+                {
+                    ThreadPool.RequestWorkerThread();
+                    break;
+                }
+                count = prev;
+            }
+        }
+
+        internal void RequestThread()
         {
             //
             // If we have not yet requested #procs threads from the VM, then request a new thread
@@ -826,6 +848,7 @@ namespace System.Threading
                     //
 
                     // TODO: VS this seems useless
+                    // workQueue.RequestThread();
                     workQueue.EnsureThreadRequested();
 
                     //
@@ -887,7 +910,7 @@ namespace System.Threading
                 // If no enqueing is happening, no new threads may be requested while there might be more work.
                 //
                 if (needAnotherThread)
-                    workQueue.EnsureThreadRequested();
+                    workQueue.RequestThread();
             }
 
             // we can never reach this point, but the C# compiler doesn't know that, because it doesn't know the ThreadAbortException will be reraised above.
