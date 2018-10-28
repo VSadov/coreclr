@@ -25,7 +25,7 @@ using Internal.Runtime.CompilerServices;
 using Microsoft.Win32;
 
 //TODO: VS remove
-//[assembly: System.Diagnostics.Debuggable(true, true)]
+// [assembly: System.Diagnostics.Debuggable(true, true)]
 
 namespace System.Threading
 {
@@ -106,50 +106,57 @@ namespace System.Threading
             /// </summary>
             public void Enqueue(IThreadPoolWorkItem item)
             {
+                var currentSegment = _enqSegment;
                 // try enqueuing. Should normally succeed unless we need a new segment.
-                if (!_enqSegment.TryEnqueue(item))
+                if (!currentSegment.TryEnqueue(item))
                 {
                     // If we're unable to, we need to take a slow path that will
                     // try to add a new tail segment.
-                    EnqueueSlow(item);
+                    EnqueueSlow(currentSegment, item);
                 }
             }
 
             /// <summary>Adds to the end of the queue, adding a new segment if necessary.</summary>
-            private void EnqueueSlow(IThreadPoolWorkItem item)
+            private void EnqueueSlow(WorkStealingQueueSegment currentSegment, IThreadPoolWorkItem item)
             {
                 for (; ; )
                 {
-                    WorkStealingQueueSegment enq = _enqSegment;
-
-                    // If we were unsuccessful, take the lock so that we can compare and manipulate
-                    // the tail.  Assuming another enqueuer hasn't already added a new segment,
-                    // do so, then loop around to try enqueueing again.
-                    lock (_crossSegmentLock)
-                    {
-                        if (enq == _enqSegment)
-                        {
-                            // Make sure no one else can enqueue to this segment.
-                            enq.EnsureFrozenForEnqueues();
-
-                            // We determine the new segment's length based on the old length.
-                            // In general, we double the size of the segment, to make it less likely
-                            // that we'll need to grow again.  
-                            int nextSize = Math.Min(enq._slots.Length * 2, MaxSegmentLength);
-                            var newEnq = new WorkStealingQueueSegment(nextSize);
-
-                            // Hook up the new tail.
-                            enq._nextSegment = newEnq;
-                            _enqSegment = newEnq;
-                        }
-                    }
-
-                    // Try to append to the existing tail.
-                    if (_enqSegment.TryEnqueue(item))
+                    currentSegment = EnsureNextSegment(currentSegment);
+                    if (currentSegment.TryEnqueue(item))
                     {
                         return;
                     }
                 }
+            }
+
+            private WorkStealingQueueSegment EnsureNextSegment(WorkStealingQueueSegment currentSegment)
+            {
+                var nextSegment = currentSegment._nextSegment;
+                if (nextSegment != null)
+                {
+                    return nextSegment;
+                }
+
+                // If we were unsuccessful, take the lock so that we can compare and manipulate
+                // the tail.  Assuming another enqueuer hasn't already added a new segment,
+                // do so, then loop around to try enqueueing again.
+                lock (_crossSegmentLock)
+                {
+                    if (currentSegment._nextSegment == null)
+                    {
+                        // We determine the new segment's length based on the old length.
+                        // In general, we double the size of the segment, to make it less likely
+                        // that we'll need to grow again.  
+                        int nextSize = Math.Min(currentSegment._slots.Length * 2, MaxSegmentLength);
+                        var newEnq = new WorkStealingQueueSegment(nextSize);
+
+                        // Hook up the new enqueue segment.
+                        currentSegment._nextSegment = newEnq;
+                        _enqSegment = newEnq;
+                    }
+                }
+
+                return currentSegment._nextSegment;
             }
 
             /// <summary>
@@ -178,29 +185,18 @@ namespace System.Threading
                 IThreadPoolWorkItem result;
                 for (; ; )
                 {
-                    // At this point we know that there is a next segment, which means
-                    // this segment has been frozen for additional enqueues. But between
+                    // At this point we know that this segment has been frozen for additional enqueues. But between
                     // the time that we ran TryDequeue and checked for a next segment,
                     // another item could have been added.  Try to dequeue one more time
                     // to confirm that the segment is indeed empty.
-                    Debug.Assert(currentSegment._frozenForEnqueues);
-                    result = currentSegment.TryDequeue();
+                    Debug.Assert(currentSegment._nextSegment != null);
+                    result = currentSegment.TryDequeue(forceSpin: true);
                     if (result != null)
                     {
                         return result;
                     }
-                    
-                    var dequeue = Volatile.Read(ref currentSegment._queueEnds.Dequeue);
-                    var enqueue = currentSegment._queueEnds.Enqueue;
 
-                    if (dequeue != enqueue && (enqueue - currentSegment.FreezeOffset != dequeue))
-                    {
-                        // there are new items in the segment already or being added
-                        // try again
-                        continue;
-                    }
-
-                    // This segment is frozen (nothing more can be added) and empty (nothing is in it).
+                    // Current segment is frozen (nothing more can be added) and empty (nothing is in it).
                     // Update head to point to the next segment in the list, assuming no one's beat us to it.
                     lock (_crossSegmentLock)
                     {
@@ -320,41 +316,6 @@ namespace System.Threading
                 internal int FreezeOffset => _slots.Length * 2;
 
                 /// <summary>
-                /// Ensures that the segment will not accept any subsequent enqueues that aren't already underway.
-                /// </summary>
-                /// <remarks>
-                /// When we mark a segment as being frozen for additional enqueues,
-                /// we set the <see cref="_frozenForEnqueues"/> bool, but that's mostly
-                /// as a small helper to avoid marking it twice.  The real marking comes
-                /// by modifying the Tail for the segment, increasing it by this
-                /// <see cref="FreezeOffset"/>.  This effectively knocks it off the
-                /// sequence expected by future enqueuers, such that any additional enqueuer
-                /// will be unable to enqueue due to it not lining up with the expected
-                /// sequence numbers.  This value is chosen specially so that Tail will grow
-                /// to a value that maps to the same slot but that won't be confused with
-                /// any other enqueue/dequeue sequence number.
-                /// </remarks>
-                internal void EnsureFrozenForEnqueues() // must only be called while queue's segment lock is held
-                {
-                    if (!_frozenForEnqueues) // flag used to ensure we don't increase the Tail more than once if frozen more than once
-                    {
-                        _frozenForEnqueues = true;
-
-                        // Increase the tail by FreezeOffset, spinning until we're successful in doing so.
-                        var spinner = new SpinWait();
-                        for (; ; )
-                        {
-                            int enqueue = Volatile.Read(ref _queueEnds.Enqueue);
-                            if (Interlocked.CompareExchange(ref _queueEnds.Enqueue, enqueue + FreezeOffset, enqueue) == enqueue)
-                            {
-                                break;
-                            }
-                            spinner.SpinOnce();
-                        }
-                    }
-                }
-
-                /// <summary>
                 /// Attempts to enqueue the item.  If successful, the item will be stored
                 /// in the queue and true will be returned; otherwise, the item won't be stored, and false
                 /// will be returned.
@@ -388,7 +349,7 @@ namespace System.Threading
 
                                 // The slot is empty and ready for us to enqueue into it.
                                 // NB: it cannot become full, since slot to the left would need to be locked
-                                if (sequenceNumber == position)
+                                if (sequenceNumber == position & !_frozenForEnqueues)
                                 {
                                     slot.Item = item;
 
@@ -397,8 +358,9 @@ namespace System.Threading
                                     // NB: volatile since must be after the item store
                                     Volatile.Write(ref slot.SequenceNumber, position + Full);
 
-                                    // advance enq (interlocked because of freezing)
-                                    Interlocked.Increment(ref _queueEnds.Enqueue);
+                                    // advance enq
+                                    // NB: not interlocked since we have locked the slot
+                                    _queueEnds.Enqueue = position + 1;
 
                                     // unlock prev slot, we are done
                                     prevSlot.SequenceNumber = prevSequenceNumber;
@@ -413,13 +375,14 @@ namespace System.Threading
                                     // The sequence number was less than what we needed, which means we have caught up with previous generation
                                     // Technically it's possible that we have dequeuers in progress and spaces are or about to be available. 
                                     // We still would be better off with a new segment.
-                                    return false;
+                                    _queueEnds.Enqueue = position + FreezeOffset;
+                                    _frozenForEnqueues = true;
                                 }
                             }
                         }
-                        else if (position - prevSequenceNumber > slotsMask)
+
+                        if (_frozenForEnqueues)
                         {
-                            // rare - happens when segment is frozen
                             return false;
                         }
 
@@ -431,13 +394,11 @@ namespace System.Threading
 
                 internal IThreadPoolWorkItem TryPop()
                 {
-                    var slots = _slots;
-                    var slotsMask = _slotsMask;
+                    IThreadPoolWorkItem item = null;
 
                 tryAgain:
-
                     int position = _queueEnds.Enqueue - 1;
-                    ref Slot slot = ref GetSlot(slots, slotsMask, position);
+                    ref Slot slot = ref GetSlot(_slots, _slotsMask, position);
 
                     // Read the sequence number for the cell.
                     int sequenceNumber = slot.SequenceNumber;
@@ -460,17 +421,21 @@ namespace System.Threading
                             // trying to enqeue will end up spinning until we do the subsequent Write.
                             // we are committed to dequeue it
 
-                            if (_queueEnds.Enqueue - 1 == position)
+                            // check if enqueue changed while we were locking the slot
+                            // if (_queueEnds.Enqueue - 1 == position)
+                            if (_queueEnds.Enqueue == sequenceNumber)
                             {
-                                var item = slot.Item;
+                                item = slot.Item;
+                                slot.Item = null;
 
-                                // interlocked because of freezing
-                                Interlocked.Decrement(ref _queueEnds.Enqueue);
+                                // advance enq
+                                // NB: not interlocked since we have locked the slot
+                                _queueEnds.Enqueue = position;
 
                                 // make the slot appear empty in the current generation.
                                 // that also unlocks the slot
-                                // NB: not volatile since the interlocked above.
-                                slot.SequenceNumber = position;
+                                // NB: must be after storing to the item and advancing enq
+                                Volatile.Write(ref slot.SequenceNumber, position);
 
                                 if (item == null)
                                 {
@@ -478,24 +443,22 @@ namespace System.Threading
                                     // this is not a race though, try again
                                     goto tryAgain;
                                 }
-
-                                return item;
                             }
                             else
                             {
                                 // enque changed, some kind of contention
                                 // unlock the slot and exit
-                                slot.SequenceNumber = position + Full;
+                                slot.SequenceNumber = sequenceNumber;
                             }
                         }
                     }
 
-                    // no items or contention (rare) - just return.
-                    return null;
+                    // no items or contention (most likely with a dequeuer) - just return.
+                    return item;
                 }
 
                 /// <summary>Tries to dequeue an element from the queue.</summary>
-                public IThreadPoolWorkItem TryDequeue()
+                public IThreadPoolWorkItem TryDequeue(bool forceSpin = false)
                 {
                     // Loop in case of contention...
                     var spinner = new SpinWait();
@@ -550,14 +513,22 @@ namespace System.Threading
                                 return item;
                             }
                         }
-                        else if (sequenceNumber == position) // empty slot => queue is empty
+                        else if (sequenceNumber < position + Full) // queue is empty
                         {
                             return null;
                         }
 
                         // Lost a race. Spin a bit, then try again.
+                        // if (spinner.NextSpinWillYield && !forceSpin)
+                        if (!forceSpin)
+                        {
+                            break;
+                        }
+
                         spinner.SpinOnce();
                     }
+
+                    return null;
                 }
 
                 [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -742,6 +713,7 @@ namespace System.Threading
             queue.Enqueue(callback);
 
             EnsureThreadRequested();
+            // RequestThread();       <- hurts serial case a lot, does not help much otherwise
         }
 
         internal bool LocalFindAndPop(IThreadPoolWorkItem callback)
@@ -749,7 +721,7 @@ namespace System.Threading
             return GetLocalQueue()?.LocalFindAndPop(callback) == true;
         }
 
-        public IThreadPoolWorkItem Dequeue()
+        public IThreadPoolWorkItem Dequeue(ref bool missedSteal)
         {
             WorkStealingQueue[] queues = localQueues;
             var localQueueIndex = GetLocalQueueIndex();
@@ -770,7 +742,7 @@ namespace System.Threading
                 // finally try stealing from all local queues
                 // Traverse all local queues starting with those that differ in lower bits and going gradually up.
                 // This way we want to minimize chances that two threads concurrently go through the same sequence of queues.
-                for (int i = 1; i < queues.Length; i++)
+                for (int i = 0; i < queues.Length; i++)
                 {
                     localWsq = queues[localQueueIndex ^ i];
                     if (localWsq?.CanSteal == true)
@@ -780,6 +752,8 @@ namespace System.Threading
                         {
                             break;
                         }
+
+                        missedSteal |= localWsq.CanSteal;
                     }
                 }
             }
@@ -826,14 +800,15 @@ namespace System.Threading
                 //
                 do
                 {
-                    workItem = workQueue.Dequeue();
+                    bool missedSteal = false;
+                    workItem = workQueue.Dequeue(ref missedSteal);
 
                     if (workItem == null)
                     {
                         //
                         // No work.
                         //
-                        needAnotherThread = false;
+                        needAnotherThread = missedSteal;
 
                         // Tell the VM we're returning normally, not because Hill Climbing asked us to return.
                         return true;
@@ -848,8 +823,7 @@ namespace System.Threading
                     //
 
                     // TODO: VS this seems useless
-                    // workQueue.RequestThread();
-                    workQueue.EnsureThreadRequested();
+                    workQueue.RequestThread();
 
                     //
                     // Execute the workitem outside of any finally blocks, so that it can be aborted if needed.
