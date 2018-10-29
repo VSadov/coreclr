@@ -422,10 +422,6 @@ namespace System.Threading
                         // if block should be wrapped in a finally / prepared region.
                         if (Interlocked.CompareExchange(ref slot.SequenceNumber, position + Change, sequenceNumber) == sequenceNumber)
                         {
-                            // Successfully reserved the slot.  Note that after the above CompareExchange, other threads
-                            // trying to enqeue will end up spinning until we do the subsequent Write.
-                            // we are committed to dequeue it
-
                             // check if enqueue changed while we were locking the slot
                             // if (_queueEnds.Enqueue - 1 == position)
                             if (_queueEnds.Enqueue == sequenceNumber)
@@ -761,8 +757,8 @@ namespace System.Threading
             //var queue = globalQueue;
             queue.Enqueue(callback);
 
+            // make sure there is at least one worker requested
             EnsureThreadRequested();
-            // RequestThread();       <- hurts serial case a lot, does not help much otherwise
         }
 
         internal bool LocalFindAndPop(IThreadPoolWorkItem callback)
@@ -839,6 +835,15 @@ namespace System.Threading
             bool needAnotherThread = true;
             IThreadPoolWorkItem workItem = null;
 
+            // On first successfull Dequeue we ask for another thread.
+            // If the new thread that comes is sucessful, it will ask for more and so on...
+            //
+            // We will repeat the request on every time quantum onwards. As long as we find work to do.
+            // If a thread finds no work due to shortage or contentions, it will exit to VM and park there.
+            //
+            // TODO: VS this means N_workers requests per quantum. Too much, not enough?
+            bool addAnotherThread = true;
+
             Threading.Thread.RefreshCurrentProcessorId();
 
             try
@@ -871,7 +876,11 @@ namespace System.Threading
                     //
 
                     // TODO: VS this seems useless
-                    workQueue.RequestThread();
+                    if (addAnotherThread)
+                    {
+                        workQueue.RequestThread();
+                        addAnotherThread = false;
+                    }
 
                     //
                     // Execute the workitem outside of any finally blocks, so that it can be aborted if needed.
