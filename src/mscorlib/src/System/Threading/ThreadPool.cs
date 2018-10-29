@@ -552,7 +552,48 @@ namespace System.Threading
 
                 internal bool TryRemove(IThreadPoolWorkItem callback)
                 {
-                    // TODO: VS
+                    for (int position = _queueEnds.Enqueue - 1, l = position - removeRange; position != l; position--)
+                    {
+                        ref Slot slot = ref GetSlot(_slots, _slotsMask, position);
+
+                        if (slot.Item == callback)
+                        {
+                            // Reserve the slot.
+                            //
+                            // WARNING:
+                            // The next few lines are not reliable on a runtime that
+                            // supports thread aborts. If a thread abort were to sneak in after the CompareExchange
+                            // but before the write to SequenceNumber, anyone trying to modify this slot would
+                            // spin indefinitely.  If this implementation is ever used on such a platform, this
+                            // if block should be wrapped in a finally / prepared region.
+                            var fullSlot = position + Full;
+                            if (Interlocked.CompareExchange(ref slot.SequenceNumber, position + Change, fullSlot) == fullSlot)
+                            {
+                                // Successfully locked the slot. 
+                                // check if the item is still there 
+                                if (slot.Item == callback)
+                                {
+                                    slot.Item = null;
+
+                                    // unlock the slot
+                                    // NB: must be after erasing the item
+                                    Volatile.Write(ref slot.SequenceNumber, fullSlot);
+                                    return true;
+                                }
+
+                                // unlock the slot and exit
+                                slot.SequenceNumber = fullSlot;
+                            }
+
+                            // lost the item to someone else
+                            break;
+                        }
+                        else if(slot.SequenceNumber > position + Change)
+                        {
+                            // reached next gen
+                            break;
+                        }
+                    }
                     return false;
                 }
 
@@ -728,7 +769,6 @@ namespace System.Threading
 
             // first try popping from the local queue
             IThreadPoolWorkItem callback = localWsq?.TryPop();
-            // IThreadPoolWorkItem callback = localWsq?.Dequeue();
 
             // then try the global queue
             if (callback == null && globalQueue.CanSteal)
