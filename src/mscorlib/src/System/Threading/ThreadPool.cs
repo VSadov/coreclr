@@ -25,7 +25,7 @@ using Internal.Runtime.CompilerServices;
 using Microsoft.Win32;
 
 //TODO: VS remove
-// [assembly: System.Diagnostics.Debuggable(true, true)]
+//[assembly: System.Diagnostics.Debuggable(true, true)]
 
 namespace System.Threading
 {
@@ -340,7 +340,7 @@ namespace System.Threading
 
                         // check if prev slot is empty in the next generation or full
                         // otherwise retry - we have some kind of race, most likely the prev item is being dequeued
-                        if (prevSequenceNumber == position + slotsMask || prevSequenceNumber == position)
+                        if (prevSequenceNumber == position + slotsMask | prevSequenceNumber == position)
                         {
                             if (Interlocked.CompareExchange(ref prevSlot.SequenceNumber, prevSequenceNumber + Change, prevSequenceNumber) == prevSequenceNumber)
                             {
@@ -374,8 +374,11 @@ namespace System.Threading
                                     // The sequence number was less than what we needed, which means we have caught up with previous generation
                                     // Technically it's possible that we have dequeuers in progress and spaces are or about to be available. 
                                     // We still would be better off with a new segment.
-                                    // NB: need a fence after Enqueue store.
+                                    //
+                                    // set Enqueue to throw off anyone else trying to enqueue or pop
+                                    // this guarantees that Enqueue will not change and no more items will be added.
                                     _queueEnds.Enqueue = position + FreezeOffset;
+                                    // NB: need a fence after Enqueue store.
                                     Volatile.Write(ref _frozenForEnqueues, true);
                                 }
 
@@ -417,7 +420,6 @@ namespace System.Threading
                         // but before the write to SequenceNumber, anyone trying to modify this slot would
                         // spin indefinitely.  If this implementation is ever used on such a platform, this
                         // if block should be wrapped in a finally / prepared region.
-                        //TODO: VS "-Change" ? to appear empty for dequeuers?
                         if (Interlocked.CompareExchange(ref slot.SequenceNumber, position + Change, sequenceNumber) == sequenceNumber)
                         {
                             // Successfully reserved the slot.  Note that after the above CompareExchange, other threads
@@ -517,8 +519,12 @@ namespace System.Threading
                                 return item;
                             }
                         }
-                        else if (!forceSpin || sequenceNumber < position + Full) // queue is empty
+                        else if (!forceSpin || position == sequenceNumber)
                         {
+                            // reached empty
+                            // since full slots are contiguous, finding an empty slot means that 
+                            // at the point when our dequeue value was set the queue was empty 
+                            // or all the values present at the time have been popped.
                             break;
                         }
 
@@ -527,6 +533,9 @@ namespace System.Threading
                         spinner.SpinOnce();
                     }
 
+                    // "null" means that:
+                    // - all items enqueued at the moment of invocation (or more precisely reading deq) are gone or
+                    // - we had a contention and forceSpin was not set
                     return null;
                 }
 
@@ -792,7 +801,7 @@ namespace System.Threading
                             break;
                         }
 
-                        missedSteal |= localWsq.CanSteal;
+                        // missedSteal |= localWsq.CanSteal;
                     }
                 }
             }
