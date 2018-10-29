@@ -842,7 +842,7 @@ namespace System.Threading
             // If a thread finds no work due to shortage or contentions, it will exit to VM and park there.
             //
             // TODO: VS this means N_workers requests per quantum. Too much, not enough?
-            bool addAnotherThread = true;
+            // bool addAnotherThread = true;
 
             Threading.Thread.RefreshCurrentProcessorId();
 
@@ -875,12 +875,13 @@ namespace System.Threading
                     // in parallel.  Note that this will only ask for a max of #procs threads, so it's safe to call it for every dequeue.
                     //
 
-                    // TODO: VS this seems useless
-                    if (addAnotherThread)
-                    {
-                        workQueue.RequestThread();
-                        addAnotherThread = false;
-                    }
+                    // TODO: VS this seems useless. 
+                    //       is there any scenario sensitive to aggressive ramp up?
+                    //if (addAnotherThread)
+                    //{
+                    //    workQueue.RequestThread();
+                    //    addAnotherThread = false;
+                    //}
 
                     //
                     // Execute the workitem outside of any finally blocks, so that it can be aborted if needed.
