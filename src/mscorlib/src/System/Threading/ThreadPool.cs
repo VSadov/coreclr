@@ -91,6 +91,20 @@ namespace System.Threading
             // TODO: VS used for debugging. may remove later.
             internal int _ID;
 
+            private uint _rnd = 6247;
+            private static uint rotl(uint r, int n) => (r << n) | (r >> (32 - n));
+
+            // Very cheap random sequence generator.
+            // We do not need a lot of randomness, I think even _rnd++ would be fairly good here. 
+            // Sequences attached to different queues go out of sync quickly and that is often sufficient.
+            // However this sequence is a bit more random at comparale cost.
+            // http://www.drdobbs.com/tools/fast-high-quality-parallel-random-number
+            internal uint NextRnd()
+            {
+                var r = _rnd;
+                return _rnd = r - rotl(r, 21);
+            }
+
             /// <summary>
             /// Initializes a new instance of the <see cref="WorkStealingQueue"/> class.
             /// </summary>
@@ -393,7 +407,6 @@ namespace System.Threading
                         }
 
                         // Lost a race. Spin a bit, then try again. 
-                        //TODO: VS needed?
                         spinner.SpinOnce();
                     }
                 }
@@ -783,12 +796,15 @@ namespace System.Threading
 
             if (callback == null)
             {
+                var qMask = queues.Length - 1;
+                var r = (int)((localWsq?.NextRnd() ?? 0) & qMask);
+
                 // finally try stealing from all local queues
                 // Traverse all local queues starting with those that differ in lower bits and going gradually up.
                 // This way we want to minimize chances that two threads concurrently go through the same sequence of queues.
-                for (int i = 0; i < queues.Length; i++)
+                for (int i = 0; i <= qMask; i++)
                 {
-                    localWsq = queues[localQueueIndex ^ i];
+                    localWsq = queues[r ^ i];
                     if (localWsq?.CanSteal == true)
                     {
                         callback = localWsq.Dequeue();
@@ -797,7 +813,7 @@ namespace System.Threading
                             break;
                         }
 
-                        // missedSteal |= localWsq.CanSteal;
+                        // missedSteal = missedSteal || localWsq.CanSteal;
                     }
                 }
             }
@@ -838,11 +854,10 @@ namespace System.Threading
             // On first successfull Dequeue we ask for another thread.
             // If the new thread that comes is sucessful, it will ask for more and so on...
             //
-            // We will repeat the request on every time quantum onwards. As long as we find work to do.
+            // We will repeat the request on every time quantum onwards + after some number of sucesses. As long as we find work to do.
             // If a thread finds no work due to shortage or contentions, it will exit to VM and park there.
             //
-            // TODO: VS this means N_workers requests per quantum. Too much, not enough?
-            // bool addAnotherThread = true;
+            int dequeuediItems = 0;
 
             Threading.Thread.RefreshCurrentProcessorId();
 
@@ -877,11 +892,11 @@ namespace System.Threading
 
                     // TODO: VS this seems useless. 
                     //       is there any scenario sensitive to aggressive ramp up?
-                    //if (addAnotherThread)
-                    //{
-                    //    workQueue.RequestThread();
-                    //    addAnotherThread = false;
-                    //}
+                    //       we are not very sensitive to this, just ask for a thread once in a while
+                    if ((dequeuediItems++ & 31) == 0)
+                    {
+                        workQueue.RequestThread();
+                    }
 
                     //
                     // Execute the workitem outside of any finally blocks, so that it can be aborted if needed.
