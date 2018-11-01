@@ -91,18 +91,19 @@ namespace System.Threading
             // TODO: VS used for debugging. may remove later.
             internal int _ID;
 
-            private uint _rnd = 6247;
-            private static uint rotl(uint r, int n) => (r << n) | (r >> (32 - n));
+            internal uint _rnd = 6247;
 
             // Very cheap random sequence generator.
             // We do not need a lot of randomness, I think even _rnd++ would be fairly good here. 
             // Sequences attached to different queues go out of sync quickly and that is often sufficient.
-            // However this sequence is a bit more random at comparale cost.
+            // However this sequence is a bit more random at comparable cost.
             // http://www.drdobbs.com/tools/fast-high-quality-parallel-random-number
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
             internal uint NextRnd()
             {
                 var r = _rnd;
-                return _rnd = r - rotl(r, 21);
+                r -= (r << 21) | (r >> 11);
+                return _rnd = r;
             }
 
             /// <summary>
@@ -797,7 +798,11 @@ namespace System.Threading
             if (callback == null)
             {
                 var qMask = queues.Length - 1;
-                var r = (int)((localWsq?.NextRnd() ?? 0) & qMask);
+                var r = 0;
+                if (localWsq != null)
+                {
+                    r = (int)localWsq.NextRnd() & qMask;
+                }
 
                 // finally try stealing from all local queues
                 // Traverse all local queues starting with those that differ in lower bits and going gradually up.
