@@ -514,6 +514,7 @@ namespace System.Threading
                                 // doing this first so that dequers would start using the next slot. this one is ours
                                 _queueEnds.Dequeue = position + 1;
                                 var item = slot.Item;
+                                slot.Item = null;
 
                                 // make the slot appear empty in the next generation
                                 // unlocks the slot for enqueuing
@@ -524,7 +525,7 @@ namespace System.Threading
                                     // the item was removed, so we have nothing to return. 
                                     // this is not a race though. just continue.
                                     spinner.Reset();
-                                    continue;
+                                    continue; 
                                 }
                                 return item;
                             }
@@ -538,7 +539,7 @@ namespace System.Threading
                             break;
                         }
 
-                        // Lost a race, but must ensure the queue is empty before giving up. 
+                        // Lost a race, but must ensure the queue is empty before giving up.  
                         // Spin a bit, then try again.
                         spinner.SpinOnce();
                     }
@@ -555,9 +556,9 @@ namespace System.Threading
                     return ref Unsafe.Add(ref Unsafe.As<byte, Slot>(ref slots.GetRawSzArrayData()), position & slotsMask);
                 }
 
-                internal bool CanSteal
+                internal bool CanSteal 
                 {
-                    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+                    [MethodImpl(MethodImplOptions.AggressiveInlining)] 
                     get
                     {
                         // Read Deq and then Enq. If not the same, there could be work for a dequeuer. 
