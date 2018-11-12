@@ -185,27 +185,12 @@ namespace System.Threading
             }
         }
 
-        internal class GlobalQueue : WorkQueueBase
+        internal class GlobalQueue: WorkQueueBase
         {
             /// <summary>The current enqueue segment.</summary>
             private GlobalQueueSegment _enqSegment;
             /// <summary>The current dequeue segment.</summary>
-            internal GlobalQueueSegment _deqSegment;
-
-            internal uint _rnd = 6247;
-
-            // Very cheap random sequence generator.
-            // We do not need a lot of randomness, I think even _rnd++ would be fairly good here. 
-            // Sequences attached to different queues go out of sync quickly and that is often sufficient.
-            // However this sequence is a bit more random at comparable cost.
-            // http://www.drdobbs.com/tools/fast-high-quality-parallel-random-number
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            internal uint NextRnd()
-            {
-                var r = _rnd;
-                r -= (r << 21) | (r >> 11);
-                return _rnd = r;
-            }
+            private GlobalQueueSegment _deqSegment;
 
             /// <summary>
             /// Initializes a new instance of the <see cref="GlobalQueue"/> class.
@@ -903,7 +888,7 @@ namespace System.Threading
                                     // the item was removed, so we have nothing to return. 
                                     // this is not a race though. just continue.
                                     spinner.Reset();
-                                    continue;
+                                    continue; 
                                 }
                                 return item;
                             }
@@ -966,7 +951,7 @@ namespace System.Threading
                             // lost the item to someone else
                             break;
                         }
-                        else if (slot.SequenceNumber > position + Change)
+                        else if(slot.SequenceNumber > position + Change)
                         {
                             // reached next gen
                             break;
@@ -977,7 +962,7 @@ namespace System.Threading
             }
         }
 
-        internal GlobalQueue[] localQueues;
+        internal LocalQueue[] localQueues;
         internal readonly GlobalQueue globalQueue = new GlobalQueue();
 
         internal bool loggingEnabled;
@@ -990,7 +975,7 @@ namespace System.Threading
         {
             loggingEnabled = FrameworkEventSource.Log.IsEnabled(EventLevel.Verbose, FrameworkEventSource.Keywords.ThreadPool | FrameworkEventSource.Keywords.ThreadTransfer);
 
-            localQueues = new GlobalQueue[RoundUpToPowerOf2(ThreadPoolGlobals.processorCount)];
+            localQueues = new LocalQueue[RoundUpToPowerOf2(ThreadPoolGlobals.processorCount)];
         }
 
         /// <summary>
@@ -1011,20 +996,20 @@ namespace System.Threading
         /// <summary>
         /// Returns a local queue softly affinitized with the current thread.
         /// </summary>
-        internal GlobalQueue GetLocalQueue()
+        internal LocalQueue GetLocalQueue()
         {
             return localQueues[GetLocalQueueIndex()];
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        internal GlobalQueue GetOrAddLocalQueue()
+        internal LocalQueue GetOrAddLocalQueue()
         {
             var index = GetLocalQueueIndex();
             var result = localQueues[index];
 
             if (result == null)
             {
-                var newQueue = new GlobalQueue();
+                var newQueue = new LocalQueue(index);
                 Interlocked.CompareExchange(ref localQueues[index], newQueue, null);
                 result = localQueues[index];
             }
@@ -1036,7 +1021,7 @@ namespace System.Threading
         {
             return Threading.Thread.GetCurrentProcessorId() & (localQueues.Length - 1);
         }
-
+        
         internal void EnsureThreadRequested()
         {
             //
@@ -1106,8 +1091,6 @@ namespace System.Threading
             if (loggingEnabled)
                 System.Diagnostics.Tracing.FrameworkEventSource.Log.ThreadPoolEnqueueWorkObject(callback);
 
-            // forceGlobal = true;
-
             if (forceGlobal)
             {
                 globalQueue.Enqueue(callback);
@@ -1123,17 +1106,17 @@ namespace System.Threading
 
         internal bool LocalFindAndPop(IThreadPoolWorkItem callback)
         {
-            return false; // GetLocalQueue()?.LocalFindAndPop(callback) == true;
+            return GetLocalQueue()?.LocalFindAndPop(callback) == true;
         }
 
         public IThreadPoolWorkItem Dequeue(ref bool missedSteal)
         {
-            GlobalQueue[] queues = localQueues;
+            LocalQueue[] queues = localQueues;
             var localQueueIndex = GetLocalQueueIndex();
-            GlobalQueue localWsq = queues[localQueueIndex];
+            LocalQueue localWsq = queues[localQueueIndex];
 
             // first try popping from the local queue
-            IThreadPoolWorkItem callback = localWsq?.Dequeue();
+            IThreadPoolWorkItem callback = localWsq?.TryPop();
 
             // then try the global queue
             if (callback == null && globalQueue.CanSteal)
@@ -1991,7 +1974,7 @@ namespace System.Threading
             //}
 
             // Enumerate each local queue
-            foreach (ThreadPoolWorkQueue.GlobalQueue wsq in workQueue.localQueues)
+            foreach (ThreadPoolWorkQueue.LocalQueue wsq in workQueue.localQueues)
             {
                 for (var head = wsq._deqSegment; head != null; head = head._nextSegment)
                 {
@@ -2009,7 +1992,7 @@ namespace System.Threading
 
         internal static IEnumerable<IThreadPoolWorkItem> GetLocallyQueuedWorkItems()
         {
-            ThreadPoolWorkQueue.GlobalQueue wsq = ThreadPoolGlobals.workQueue?.GetLocalQueue();
+            ThreadPoolWorkQueue.LocalQueue wsq = ThreadPoolGlobals.workQueue?.GetLocalQueue();
             for (var head = wsq._deqSegment; head != null; head = head._nextSegment)
             {
                 foreach (var slot in head._slots)
