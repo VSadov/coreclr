@@ -80,7 +80,7 @@ namespace System.Threading
             /// Lock used to protect cross-segment operations, including any updates to <see cref="_enqSegment"/> or <see cref="_deqSegment"/>
             /// and any operations that need to get a consistent view of them.
             /// </summary>
-            internal object _crossSegmentLock;
+            internal object _addSegmentLock;
 
             /// <summary>Padded head and tail indices, to avoid false sharing between producers and consumers.</summary>
             [DebuggerDisplay("Head = {Head}, Tail = {Tail}, Pop = {Pop}")]
@@ -113,19 +113,19 @@ namespace System.Threading
                 internal const int Full = 1;
 
                 /// <summary>Creates the segment.</summary>
-                /// <param name="boundedLength">
+                /// <param name="length">
                 /// The maximum number of elements the segment can contain.  Must be a power of 2.
                 /// </param>
-                internal QueueSegmentBase(int boundedLength)
+                internal QueueSegmentBase(int length)
                 {
                     // Validate the length
-                    Debug.Assert(boundedLength >= 2, $"Must be >= 2, got {boundedLength}");
-                    Debug.Assert((boundedLength & (boundedLength - 1)) == 0, $"Must be a power of 2, got {boundedLength}");
+                    Debug.Assert(length >= 2, $"Must be >= 2, got {length}");
+                    Debug.Assert((length & (length - 1)) == 0, $"Must be a power of 2, got {length}");
 
                     // Initialize the slots and the mask.  The mask is used as a way of quickly doing "% _slots.Length",
                     // instead letting us do "& _slotsMask".
-                    var slots = new Slot[boundedLength];
-                    _slotsMask = boundedLength - 1;
+                    var slots = new Slot[length];
+                    _slotsMask = length - 1;
 
                     // Initialize the sequence number for each slot.  The sequence number provides a ticket that
                     // allows dequeuers to know whether they can dequeue and enqueuers to know whether they can
@@ -197,7 +197,7 @@ namespace System.Threading
             /// </summary>
             internal GlobalQueue()
             {
-                _crossSegmentLock = new object();
+                _addSegmentLock = new object();
                 _enqSegment = _deqSegment = new GlobalQueueSegment(InitialSegmentLength);
             }
 
@@ -210,13 +210,15 @@ namespace System.Threading
                 // try enqueuing. Should normally succeed unless we need a new segment.
                 if (!currentSegment.TryEnqueue(item))
                 {
-                    // If we're unable to, we need to take a slow path that will
-                    // try to add a new tail segment.
+                    // If we're unable to enque, this segment is done for.
+                    // we need to take a slow path that will try adding a new tail segment.
                     EnqueueSlow(currentSegment, item);
                 }
             }
 
-            /// <summary>Adds to the end of the queue, adding a new segment if necessary.</summary>
+            /// <summary>
+            /// Adds to the end of the queue, adding a new segment if necessary.
+            /// </summary>
             private void EnqueueSlow(GlobalQueueSegment currentSegment, IThreadPoolWorkItem item)
             {
                 for (; ; )
@@ -237,10 +239,10 @@ namespace System.Threading
                     return nextSegment;
                 }
 
-                // If we were unsuccessful, take the lock so that we can compare and manipulate
-                // the tail.  Assuming another enqueuer hasn't already added a new segment,
-                // do so, then loop around to try enqueueing again.
-                lock (_crossSegmentLock)
+                // take the lock to add a new segment
+                // we can make this optimistically lock free, but it is a rare code path
+                // and we do not want stampeding enqueuers allocating a lot of new segments when only one will win.
+                lock (_addSegmentLock)
                 {
                     if (currentSegment._nextSegment == null)
                     {
@@ -298,7 +300,7 @@ namespace System.Threading
 
                     // Current segment is frozen (nothing more can be added) and empty (nothing is in it).
                     // Update head to point to the next segment in the list, assuming no one's beat us to it.
-                    lock (_crossSegmentLock)
+                    lock (_addSegmentLock)
                     {
                         if (currentSegment == _deqSegment)
                         {
@@ -328,6 +330,7 @@ namespace System.Threading
             /// <summary>
             /// Returns true if an item can be dequeued.
             /// There are no gurantees, obviously, since the queue may concurrently change. Just a cheap check.
+            /// NB: frozen segment always reports "CanSteal"
             /// </summary>
             internal bool CanSteal
             {
@@ -349,10 +352,10 @@ namespace System.Threading
                 internal GlobalQueueSegment _nextSegment;
 
                 /// <summary>Creates the segment.</summary>
-                /// <param name="boundedLength">
+                /// <param name="length">
                 /// The maximum number of elements the segment can contain.  Must be a power of 2.
                 /// </param>
-                internal GlobalQueueSegment(int boundedLength) : base(boundedLength) { }
+                internal GlobalQueueSegment(int length) : base(length) { }
 
                 /// <summary>
                 /// Attempts to enqueue the item.  If successful, the item will be stored
@@ -402,6 +405,7 @@ namespace System.Threading
                             // The sequence number was less than what we needed, which means we have caught up with previous generation
                             // Technically it's possible that we have dequeuers in progress and spaces are or about to be available. 
                             // We still would be better off with a new segment.
+                            // NB: Make sure that by the time we return with a failure no nore items could be added.
                             EnsureFrozenForEnqueues();
                             return false;
                         }
@@ -485,6 +489,7 @@ namespace System.Threading
                         }
 
                         // Lost a race. Spin a bit, then try again.
+                        // TODO: (vsadov) do we want to unconditionally spin, or should go stealing?
                         spinner.SpinOnce();
                     }
                 }
@@ -498,7 +503,7 @@ namespace System.Threading
             /// <summary>The current dequeue segment.</summary>
             internal LocalQueueSegment _deqSegment;
 
-            // TODO: VS used for debugging. may remove later.
+            // TODO: (vsadov) used for debugging. remove later.
             internal int _ID;
 
             internal uint _rnd = 6247;
@@ -506,12 +511,13 @@ namespace System.Threading
             // Very cheap random sequence generator.
             // We do not need a lot of randomness, I think even _rnd++ would be fairly good here. 
             // Sequences attached to different queues go out of sync quickly and that is often sufficient.
-            // However this sequence is a bit more random at comparable cost.
+            // However this sequence is a bit more random at a very modest cost.
             // http://www.drdobbs.com/tools/fast-high-quality-parallel-random-number
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
             internal uint NextRnd()
             {
                 var r = _rnd;
+                // rotr 11
                 r -= (r << 21) | (r >> 11);
                 return _rnd = r;
             }
@@ -522,7 +528,7 @@ namespace System.Threading
             internal LocalQueue(int ID)
             {
                 _ID = ID;
-                _crossSegmentLock = new object();
+                _addSegmentLock = new object();
                 _enqSegment = _deqSegment = new LocalQueueSegment(InitialSegmentLength);
             }
 
@@ -535,13 +541,15 @@ namespace System.Threading
                 // try enqueuing. Should normally succeed unless we need a new segment.
                 if (!currentSegment.TryEnqueue(item))
                 {
-                    // If we're unable to, we need to take a slow path that will
-                    // try to add a new tail segment.
+                    // If we're unable to enque, this segment is done for.
+                    // we need to take a slow path that will try adding a new tail segment.
                     EnqueueSlow(currentSegment, item);
                 }
             }
 
-            /// <summary>Adds to the end of the queue, adding a new segment if necessary.</summary>
+            /// <summary>
+            /// Adds to the end of the queue, adding a new segment if necessary.
+            /// </summary>
             private void EnqueueSlow(LocalQueueSegment currentSegment, IThreadPoolWorkItem item)
             {
                 for (; ; )
@@ -562,10 +570,10 @@ namespace System.Threading
                     return nextSegment;
                 }
 
-                // If we were unsuccessful, take the lock so that we can compare and manipulate
-                // the tail.  Assuming another enqueuer hasn't already added a new segment,
-                // do so, then loop around to try enqueueing again.
-                lock (_crossSegmentLock)
+                // take the lock to add a new segment
+                // we can make this optimistically lock free, but it is a rare code path
+                // and we do not want stampeding enqueuers allocating a lot of new segments when only one will win.
+                lock (_addSegmentLock)
                 {
                     if (currentSegment._nextSegment == null)
                     {
@@ -623,7 +631,7 @@ namespace System.Threading
 
                     // Current segment is frozen (nothing more can be added) and empty (nothing is in it).
                     // Update head to point to the next segment in the list, assuming no one's beat us to it.
-                    lock (_crossSegmentLock)
+                    lock (_addSegmentLock)
                     {
                         if (currentSegment == _deqSegment)
                         {
@@ -653,6 +661,7 @@ namespace System.Threading
             /// <summary>
             /// Returns true if an item can be dequeued.
             /// There are no gurantees, obviously, since the queue may concurrently change. Just a cheap check.
+            /// NB: frozen segment always reports "CanSteal"
             /// </summary>
             internal bool CanSteal
             {
@@ -668,7 +677,7 @@ namespace System.Threading
                 return this._enqSegment.TryPop();
             }
 
-            internal bool LocalFindAndPop(IThreadPoolWorkItem callback)
+            internal bool TryRemove(IThreadPoolWorkItem callback)
             {
                 return this._enqSegment.TryRemove(callback);
             }
@@ -1104,9 +1113,20 @@ namespace System.Threading
             EnsureThreadRequested();
         }
 
-        internal bool LocalFindAndPop(IThreadPoolWorkItem callback)
+        internal bool TryRemove(IThreadPoolWorkItem callback)
         {
-            return GetLocalQueue()?.LocalFindAndPop(callback) == true;
+            bool result = false;
+            var localQueue = GetLocalQueue();
+            if (localQueue != null)
+            {
+                result = localQueue.TryRemove(callback);
+
+                // prevent highly improbable but theoretically possible case of pool drainage - 
+                // if the only alive dequeuer gives up on a contention with remover (regardless if remove is successfull or not)
+                this.EnsureThreadRequested();
+            }
+
+            return result;
         }
 
         public IThreadPoolWorkItem Dequeue(ref bool missedSteal)
@@ -1127,13 +1147,13 @@ namespace System.Threading
             if (callback == null)
             {
                 var qMask = queues.Length - 1;
-                var r = 0;
+                var r = localQueueIndex;
                 if (localWsq != null)
                 {
                     r = (int)localWsq.NextRnd() & qMask;
                 }
 
-                // finally try stealing from all local queues
+                // finally try stealing from local queues
                 // Traverse all local queues starting with those that differ in lower bits and going gradually up.
                 // This way we want to minimize chances that two threads concurrently go through the same sequence of queues.
                 for (int i = 0; i <= qMask; i++)
@@ -1959,7 +1979,7 @@ namespace System.Threading
             Debug.Assert(null != workItem);
             return
                 ThreadPoolGlobals.vmTpInitialized && // if not initialized, so there's no way this workitem was ever queued.
-                ThreadPoolGlobals.workQueue.LocalFindAndPop(workItem);
+                ThreadPoolGlobals.workQueue.TryRemove(workItem);
         }
 
         // Get all workitems.  Called by TaskScheduler in its debugger hooks.
