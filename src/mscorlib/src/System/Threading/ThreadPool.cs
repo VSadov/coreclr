@@ -336,8 +336,7 @@ namespace System.Threading
             {
                 get
                 {
-                    var deqSegment = this._deqSegment;
-                    return deqSegment.CanSteal;
+                    return this._deqSegment.CanSteal;
                 }
             }
 
@@ -667,8 +666,7 @@ namespace System.Threading
             {
                 get
                 {
-                    var deqSegment = this._deqSegment;
-                    return deqSegment.CanSteal;
+                    return this._deqSegment.CanSteal;
                 }
             }
 
@@ -710,8 +708,6 @@ namespace System.Threading
                 internal bool TryEnqueue(IThreadPoolWorkItem item)
                 {
                     // Loop in case of contention...
-                    var spinner = new SpinWait();
-
                     for (; ; )
                     {
                         var slots = _slots;
@@ -720,6 +716,9 @@ namespace System.Threading
                         // IMPORTANT: hot path. 
                         //            get from fetching Equeue to the following CmpExch as fast as possible. 
                         //            Lest we will clash with other enqueuers (only an issue when this is a global queue).
+                        // NB: Engueue must be read before SequenceNumber, 
+                        //     but the actual read of SequenceNumber is via CAS, so no need for volatile here.
+                        //     besides SequenceNumber is a dependent read anyways
                         int position = _queueEnds.Enqueue;
                         ref Slot prevSlot = ref GetSlot(slots, slotsMask, position - 1);
 
@@ -748,7 +747,7 @@ namespace System.Threading
 
                                     // mark slot as full 
                                     // this enables the slot for dequeuing
-                                    // NB: volatile since we need a fence after item and Enqueue stores
+                                    // NB: volatile since we need a fence since item and Enqueue stores must be earlier than SequenceNumber
                                     Volatile.Write(ref slot.SequenceNumber, position + Full);
 
                                     // unlock prev slot, we are done
@@ -765,7 +764,7 @@ namespace System.Threading
                                     // set Enqueue to throw off anyone else trying to enqueue or pop
                                     // this guarantees that Enqueue will not change and no more items will be added.
                                     _queueEnds.Enqueue = position + FreezeOffset;
-                                    // NB: need a fence after Enqueue store.
+                                    // NB: need a fence after Enqueue store since SequenceNumber should be written to after.
                                     Volatile.Write(ref _frozenForEnqueues, true);
                                 }
 
@@ -779,8 +778,7 @@ namespace System.Threading
                             return false;
                         }
 
-                        // Lost a race. Spin a bit, then try again. 
-                        spinner.SpinOnce();
+                        // Lost a race. Probably to dequeuer of the last item. Try again. 
                     }
                 }
 
@@ -808,7 +806,7 @@ namespace System.Threading
                         // if block should be wrapped in a finally / prepared region.
                         if (Interlocked.CompareExchange(ref slot.SequenceNumber, position + Change, sequenceNumber) == sequenceNumber)
                         {
-                            // check if enqueue changed while we were locking the slot
+                            // confirm that enqueue did not change while we were locking the slot (very rarely we may contend with Pop or Enqueue)
                             // if (_queueEnds.Enqueue - 1 == position)
                             if (_queueEnds.Enqueue == sequenceNumber)
                             {
@@ -833,7 +831,7 @@ namespace System.Threading
                             }
                             else
                             {
-                                // enque changed, some kind of contention
+                                // enqueue changed, some kind of contention
                                 // unlock the slot and exit
                                 slot.SequenceNumber = sequenceNumber;
                             }
@@ -848,8 +846,6 @@ namespace System.Threading
                 internal IThreadPoolWorkItem TryDequeue(bool forceSpin = false)
                 {
                     // Loop in case of contention...
-                    var spinner = new SpinWait();
-
                     for (; ; )
                     {
                         // we may need this later. Read it now.
@@ -882,9 +878,10 @@ namespace System.Threading
                                 // trying to enqeue will end up spinning until we do the subsequent Write.
                                 // we are committed to dequeue it
 
-                                // NB: not interlocked since we have locked the slot
                                 // doing this first so that dequers would start using the next slot. this one is ours
+                                // NB: not interlocked since we have locked the slot
                                 _queueEnds.Dequeue = position + 1;
+
                                 var item = slot.Item;
                                 slot.Item = null;
 
@@ -896,7 +893,6 @@ namespace System.Threading
                                 {
                                     // the item was removed, so we have nothing to return. 
                                     // this is not a race though. just continue.
-                                    spinner.Reset();
                                     continue; 
                                 }
                                 return item;
@@ -911,13 +907,12 @@ namespace System.Threading
                             break;
                         }
 
-                        // Lost a race, but must ensure the queue is empty before giving up.  
-                        // Spin a bit, then try again.
-                        spinner.SpinOnce();
+                        // Lost a race, but are told to ensure the queue is empty before giving up.  
+                        // try again.
                     }
 
                     // "null" means that:
-                    // - all items enqueued at the moment of invocation (or more precisely reading deq) are gone or
+                    // - all items enqueued at the moment of invocation (or more precisely at reading dequeue) are gone or
                     // - we had a contention and forceSpin was not set
                     return null;
                 }
@@ -1129,7 +1124,7 @@ namespace System.Threading
             return result;
         }
 
-        public IThreadPoolWorkItem Dequeue(ref bool missedSteal)
+        public IThreadPoolWorkItem Dequeue()
         {
             LocalQueue[] queues = localQueues;
             var localQueueIndex = GetLocalQueueIndex();
@@ -1147,10 +1142,10 @@ namespace System.Threading
             if (callback == null)
             {
                 var qMask = queues.Length - 1;
-                var r = localQueueIndex;
                 if (localWsq != null)
                 {
-                    r = (int)localWsq.NextRnd() & qMask;
+                    // randomize starting stealing queue.
+                    localQueueIndex = (int)localWsq.NextRnd() & qMask;
                 }
 
                 // finally try stealing from local queues
@@ -1158,7 +1153,7 @@ namespace System.Threading
                 // This way we want to minimize chances that two threads concurrently go through the same sequence of queues.
                 for (int i = 0; i <= qMask; i++)
                 {
-                    localWsq = queues[r ^ i];
+                    localWsq = queues[localQueueIndex ^ i];
                     if (localWsq?.CanSteal == true)
                     {
                         callback = localWsq.Dequeue();
@@ -1166,8 +1161,6 @@ namespace System.Threading
                         {
                             break;
                         }
-
-                        // missedSteal = missedSteal || localWsq.CanSteal;
                     }
                 }
             }
@@ -1210,7 +1203,7 @@ namespace System.Threading
             // We will repeat the request on every time quantum onwards + after some number of sucesses. As long as we find work to do.
             // If a thread finds no work due to shortage or contentions, it will exit to VM and park there.
             //
-            int dequeuediItems = 0;
+            int dequeuedItems = 0;
 
             Threading.Thread.RefreshCurrentProcessorId();
 
@@ -1221,15 +1214,16 @@ namespace System.Threading
                 //
                 do
                 {
-                    bool missedSteal = false;
-                    workItem = workQueue.Dequeue(ref missedSteal);
+                    workItem = workQueue.Dequeue();
 
                     if (workItem == null)
                     {
                         //
-                        // No work.
+                        // No work. Or contention.
+                        // In any case we proceed to the exit.
+                        // NB: If it was really a contention, we will have a successful Dequeue in another worker.
                         //
-                        needAnotherThread = missedSteal;
+                        needAnotherThread = false;
 
                         // Tell the VM we're returning normally, not because Hill Climbing asked us to return.
                         return true;
@@ -1246,7 +1240,7 @@ namespace System.Threading
                     // TODO: VS this seems useless. 
                     //       is there any scenario sensitive to aggressive ramp up?
                     //       we are not very sensitive to this, just ask for a thread once in a while
-                    if ((dequeuediItems++ & 31) == 0)
+                    if ((dequeuedItems++ & 31) == 0)
                     {
                         workQueue.RequestThread();
                     }
@@ -1306,8 +1300,7 @@ namespace System.Threading
             finally
             {
                 //
-                // If we are exiting for any reason other than that the queue is definitely empty, ask for another thread.
-                // If no enqueing is happening, no new threads may be requested while there might be more work.
+                // We are exiting, but we think ther could be more work. Ask for a thread that would replace us.
                 //
                 if (needAnotherThread)
                     workQueue.RequestThread();
