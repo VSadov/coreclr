@@ -482,7 +482,7 @@ namespace System.Threading
                                 return item;
                             }
                         }
-                        else if (sequenceNumber < position + Full)
+                        else if (sequenceNumber < position + Full) 
                         {
                             return null;
                         }
@@ -514,13 +514,13 @@ namespace System.Threading
             // http://www.drdobbs.com/tools/fast-high-quality-parallel-random-number
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
             internal uint NextRnd()
-            {
+            { 
                 var r = _rnd;
                 // rotr 11
                 r -= (r << 21) | (r >> 11);
                 return _rnd = r;
             }
-
+             
             /// <summary>
             /// Initializes a new instance of the <see cref="LocalQueue"/> class.
             /// </summary>
@@ -969,7 +969,7 @@ namespace System.Threading
         internal LocalQueue[] localQueues;
         internal readonly GlobalQueue globalQueue = new GlobalQueue();
 
-        internal bool loggingEnabled;
+        internal bool loggingEnabled; 
 
         private Internal.PaddingFor32 pad1;
         private int numOutstandingThreadRequests = 0;
@@ -1023,9 +1023,14 @@ namespace System.Threading
 
         internal int GetLocalQueueIndex()
         {
-            return Threading.Thread.GetCurrentProcessorId() & (localQueues.Length - 1);
+            return GetLocalQueueIndex(Threading.Thread.GetCurrentProcessorId());
         }
-        
+
+        internal int GetLocalQueueIndex(int procId)
+        {
+            return procId & (localQueues.Length - 1);
+        }
+
         internal void EnsureThreadRequested()
         {
             //
@@ -1124,10 +1129,9 @@ namespace System.Threading
             return result;
         }
 
-        public IThreadPoolWorkItem Dequeue()
+        public IThreadPoolWorkItem Dequeue(int localQueueIndex)
         {
             LocalQueue[] queues = localQueues;
-            var localQueueIndex = GetLocalQueueIndex();
             LocalQueue localWsq = queues[localQueueIndex];
 
             // first try popping from the local queue
@@ -1188,7 +1192,12 @@ namespace System.Threading
             workQueue.MarkThreadRequestSatisfied();
 
             // Has the desire for logging changed since the last time we entered?
-            workQueue.loggingEnabled = FrameworkEventSource.Log.IsEnabled(EventLevel.Verbose, FrameworkEventSource.Keywords.ThreadPool | FrameworkEventSource.Keywords.ThreadTransfer);
+            var enabled = FrameworkEventSource.Log.IsEnabled(EventLevel.Verbose, FrameworkEventSource.Keywords.ThreadPool | FrameworkEventSource.Keywords.ThreadTransfer);
+            if (workQueue.loggingEnabled != enabled)
+            {
+                // writing shared state.
+                workQueue.loggingEnabled = enabled;
+            }
 
             //
             // Assume that we're going to need another thread if this one returns to the VM.  We'll set this to 
@@ -1205,16 +1214,15 @@ namespace System.Threading
             //
             int dequeuedItems = 0;
 
-            Threading.Thread.RefreshCurrentProcessorId();
-
             try
             {
+                var localQueueIndex = workQueue.GetLocalQueueIndex(Threading.Thread.RefreshCurrentProcessorId());
                 //
                 // Loop until our quantum expires.
                 //
                 do
                 {
-                    workItem = workQueue.Dequeue();
+                    workItem = workQueue.Dequeue(localQueueIndex);
 
                     if (workItem == null)
                     {
