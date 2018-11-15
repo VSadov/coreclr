@@ -50,19 +50,15 @@ namespace System.Threading
         {
             // This implementation provides an unbounded, multi-producer multi-consumer queue
             // that supports the standard Enqueue/Dequeue operations.
-            // It is composed of a linked list of bounded ring buffers, each of which has a head
-            // and a tail index, isolated from each other to minimize false sharing.  As long as
+            // It is composed of a linked list of bounded ring buffers, each of which has an enqueue
+            // and a dequeue index, isolated from each other to minimize false sharing.  As long as
             // the number of elements in the queue remains less than the size of the current
             // buffer (Segment), no additional allocations are required for enqueued items.  When
             // the number of items exceeds the size of the current segment, the current segment is
             // "frozen" to prevent further enqueues, and a new segment is linked from it and set
             // as the new tail segment for subsequent enqueues.  As old segments are consumed by
-            // dequeues, the head reference is updated to point to the segment that dequeuers should
+            // dequeues, the dequeue reference is updated to point to the segment that dequeuers should
             // try next.
-            // The queue also supports Pop operation from the enqueuing end or by selectively removing
-            // particular items. 
-            // Items can be Popped only from the tail segment. 
-            // Older segments are supposed to be consumed by dequeues and retired.
 
             /// <summary>
             /// Initial length of the segments used in the queue. 
@@ -82,10 +78,8 @@ namespace System.Threading
             /// </summary>
             internal object _addSegmentLock;
 
-            /// <summary>Padded head and tail indices, to avoid false sharing between producers and consumers.</summary>
-            [DebuggerDisplay("Head = {Head}, Tail = {Tail}, Pop = {Pop}")]
             [StructLayout(LayoutKind.Explicit, Size = 3 * Internal.PaddingHelpers.CACHE_LINE_SIZE)] // padding before/between/after fields
-            internal struct PaddedHeadAndTail
+            internal struct PaddedQueueEnds
             {
                 [FieldOffset(1 * Internal.PaddingHelpers.CACHE_LINE_SIZE)] public int Dequeue;
                 [FieldOffset(2 * Internal.PaddingHelpers.CACHE_LINE_SIZE)] public int Enqueue;
@@ -102,9 +96,8 @@ namespace System.Threading
                 /// <summary>Mask for quickly accessing a position within the queue's array.</summary>
                 internal readonly int _slotsMask;
 
-                /// <summary>The head and tail positions, with padding to help avoid false sharing contention.</summary>
-                /// <remarks>Dequeuing happens from the head, enqueuing happens at the tail.</remarks>
-                internal PaddedHeadAndTail _queueEnds; // mutable struct: do not make this readonly
+                /// <summary>The queue end positions, with padding to help avoid false sharing contention.</summary>
+                internal PaddedQueueEnds _queueEnds; // mutable struct: do not make this readonly
 
                 /// <summary>Indicates whether the segment has been marked such that no additional items may be enqueued.</summary>
                 internal bool _frozenForEnqueues;
@@ -185,12 +178,12 @@ namespace System.Threading
             }
         }
 
-        internal class GlobalQueue: WorkQueueBase
+        internal sealed class GlobalQueue: WorkQueueBase
         {
             /// <summary>The current enqueue segment.</summary>
-            private GlobalQueueSegment _enqSegment;
+            internal GlobalQueueSegment _enqSegment;
             /// <summary>The current dequeue segment.</summary>
-            private GlobalQueueSegment _deqSegment;
+            internal GlobalQueueSegment _deqSegment;
 
             /// <summary>
             /// Initializes a new instance of the <see cref="GlobalQueue"/> class.
@@ -202,7 +195,7 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// Adds an object to the end of the <see cref="LocalQueue"/>
+            /// Adds an object to the top of the <see cref="LocalQueue"/>
             /// </summary>
             internal void Enqueue(IThreadPoolWorkItem item)
             {
@@ -211,7 +204,7 @@ namespace System.Threading
                 if (!currentSegment.TryEnqueue(item))
                 {
                     // If we're unable to enque, this segment is done for.
-                    // we need to take a slow path that will try adding a new tail segment.
+                    // we need to take a slow path that will try adding a new segment.
                     EnqueueSlow(currentSegment, item);
                 }
             }
@@ -262,7 +255,7 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// Removes an object at the beginning of the <see cref="LocalQueue"/>
+            /// Removes an object at the bottom of the <see cref="LocalQueue"/>
             /// Returns null if the queue is empty.
             /// </summary>
             internal IThreadPoolWorkItem Dequeue()
@@ -299,7 +292,7 @@ namespace System.Threading
                     }
 
                     // Current segment is frozen (nothing more can be added) and empty (nothing is in it).
-                    // Update head to point to the next segment in the list, assuming no one's beat us to it.
+                    // Update _deqSegment to point to the next segment in the list, assuming no one's beat us to it.
                     lock (_addSegmentLock)
                     {
                         if (currentSegment == _deqSegment)
@@ -308,7 +301,6 @@ namespace System.Threading
                         }
                     }
 
-                    // Get the current head
                     currentSegment = _deqSegment;
 
                     // Try to take.  If we're successful, we're done.
@@ -358,8 +350,8 @@ namespace System.Threading
 
                 /// <summary>
                 /// Attempts to enqueue the item.  If successful, the item will be stored
-                /// in the queue and true will be returned; otherwise, the item won't be stored, and false
-                /// will be returned.
+                /// in the queue and true will be returned; otherwise, the item won't be stored, the segment will be frozen 
+                /// and false will be returned.
                 /// </summary>
                 public bool TryEnqueue(IThreadPoolWorkItem item)
                 {
@@ -383,23 +375,16 @@ namespace System.Threading
                         if (sequenceNumber == position)
                         {
                             // Reserve the slot for Enqueuing.
-                            //
-                            // WARNING:
-                            // The next few lines are not reliable on a runtime that
-                            // supports thread aborts. If a thread abort were to sneak in after the CompareExchange
-                            // but before the write to SequenceNumber, anyone trying to modify this slot would
-                            // spin indefinitely.  If this implementation is ever used on such a platform, this
-                            // if block should be wrapped in a finally / prepared region.
                             if (Interlocked.CompareExchange(ref _queueEnds.Enqueue, position + 1, position) == position)
                             {
                                 // Successfully reserved the slot.  Note that after the above CompareExchange, other threads
-                                // trying to return will end up spinning until we do the subsequent Write.                               
+                                // trying to deque this slot will end up spinning until we do the subsequent Write.                               
                                 slot.Item = item;
                                 Volatile.Write(ref slot.SequenceNumber, position + Full);
                                 return true;
                             }
                         }
-                        else if (sequenceNumber < position)
+                        else if (sequenceNumber - position < 0)
                         {
                             // The sequence number was less than what we needed, which means we have caught up with previous generation
                             // Technically it's possible that we have dequeuers in progress and spaces are or about to be available. 
@@ -416,12 +401,14 @@ namespace System.Threading
 
                 internal void EnsureFrozenForEnqueues()
                 {
-                    // flag used to ensure we don't increase the Tail more than once if frozen more than once
+                    // flag used to ensure we don't increase the enqueue more than once
                     if (!_frozenForEnqueues)
                     {
                         lock (this)
                         {
-                            // Increase the tail by FreezeOffset, spinning until we're successful in doing so.
+                            // Increase the enqueue by FreezeOffset, spinning until we're successful in doing so.
+                            // enqueuing will be impossible after that
+                            // dequeuers would need to dequeue 2 generations to catch up, and they can't
                             var spinner = new SpinWait();
                             for (; ; )
                             {
@@ -456,20 +443,13 @@ namespace System.Threading
                         int position = _queueEnds.Dequeue;
                         ref Slot slot = ref GetSlot(slots, slotsMask, position);
 
-                        // Read the sequence number for the tail position.
+                        // Read the sequence number for the slot.
                         int sequenceNumber = Volatile.Read(ref slot.SequenceNumber);
 
                         // Check if the slot is considered Full in the current generation.
                         if (sequenceNumber == position + Full)
                         {
                             // Reserve the slot for Dequeuing.
-                            //
-                            // WARNING:
-                            // The next few lines are not reliable on a runtime that
-                            // supports thread aborts. If a thread abort were to sneak in after the CompareExchange
-                            // but before the write to SequenceNumber, anyone trying to modify this slot would
-                            // spin indefinitely.  If this implementation is ever used on such a platform, this
-                            // if block should be wrapped in a finally / prepared region.
                             if (Interlocked.CompareExchange(ref _queueEnds.Dequeue, position + 1, position) == position)
                             {
                                 // Successfully reserved the slot.  Note that after the above CompareExchange, other threads
@@ -478,55 +458,59 @@ namespace System.Threading
                                 slot.Item = null;
 
                                 // make the slot appear empty in the next generation
-                                Volatile.Write(ref slot.SequenceNumber, position + Empty + slots.Length);
+                                Volatile.Write(ref slot.SequenceNumber, position + 1 + slotsMask);
                                 return item;
                             }
                         }
-                        else if (sequenceNumber < position + Full) 
+                        else if (sequenceNumber - position < Full) 
                         {
+                            // The sequence number was less than what we needed, which means we have caught up with previous generation
                             return null;
                         }
 
                         // Lost a race. Spin a bit, then try again.
-                        // TODO: (vsadov) do we want to unconditionally spin, or should go stealing?
                         spinner.SpinOnce();
                     }
                 }
             }
         }
 
-        internal class LocalQueue : WorkQueueBase
+        internal sealed class LocalQueue : WorkQueueBase
         {
             /// <summary>The current enqueue segment.</summary>
             internal LocalQueueSegment _enqSegment;
             /// <summary>The current dequeue segment.</summary>
             internal LocalQueueSegment _deqSegment;
 
-            // TODO: (vsadov) used for debugging. remove later.
-            internal int _ID;
+            [StructLayout(LayoutKind.Sequential)]
+            private struct Rnd
+            {
+                private Internal.PaddingFor32 pad1;
+                internal uint val;
+                private Internal.PaddingFor32 pad2;
+            }
 
-            internal uint _rnd = 6247;
+            private Rnd _rnd = new Rnd() { val = 6247 };
 
             // Very cheap random sequence generator.
             // We do not need a lot of randomness, I think even _rnd++ would be fairly good here. 
-            // Sequences attached to different queues go out of sync quickly and that is often sufficient.
-            // However this sequence is a bit more random at a very modest cost.
-            // http://www.drdobbs.com/tools/fast-high-quality-parallel-random-number
+            // Sequences attached to different queues go out of sync quickly and that could be sufficient.
+            // However this sequence is a bit more random at a very modest additional cost.
+            // http://www.drdobbs.com/tools/fast-high-quality-parallel-random-number            
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
             internal uint NextRnd()
-            { 
-                var r = _rnd;
-                // rotr 11
+            {
+                var r = _rnd.val;
+                // r -= r rotr 11
                 r -= (r << 21) | (r >> 11);
-                return _rnd = r;
+                return _rnd.val = r;
             }
-             
+
             /// <summary>
             /// Initializes a new instance of the <see cref="LocalQueue"/> class.
             /// </summary>
-            internal LocalQueue(int ID)
+            internal LocalQueue()
             {
-                _ID = ID;
                 _addSegmentLock = new object();
                 _enqSegment = _deqSegment = new LocalQueueSegment(InitialSegmentLength);
             }
@@ -541,7 +525,7 @@ namespace System.Threading
                 if (!currentSegment.TryEnqueue(item))
                 {
                     // If we're unable to enque, this segment is done for.
-                    // we need to take a slow path that will try adding a new tail segment.
+                    // we need to take a slow path that will try adding a new segment.
                     EnqueueSlow(currentSegment, item);
                 }
             }
@@ -592,10 +576,10 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// Removes an object at the beginning of the <see cref="LocalQueue"/>
+            /// Removes an object at the bottom of the <see cref="LocalQueue"/>
             /// Returns null if the queue is empty.
             /// </summary>
-            internal virtual IThreadPoolWorkItem Dequeue()
+            internal IThreadPoolWorkItem Dequeue()
             {
                 var currentSegment = _deqSegment;
                 IThreadPoolWorkItem result = currentSegment.TryDequeue();
@@ -629,7 +613,7 @@ namespace System.Threading
                     }
 
                     // Current segment is frozen (nothing more can be added) and empty (nothing is in it).
-                    // Update head to point to the next segment in the list, assuming no one's beat us to it.
+                    // Update _deqSegment to point to the next segment in the list, assuming no one's beat us to it.
                     lock (_addSegmentLock)
                     {
                         if (currentSegment == _deqSegment)
@@ -638,7 +622,6 @@ namespace System.Threading
                         }
                     }
 
-                    // Get the current head
                     currentSegment = _deqSegment;
 
                     // Try to take.  If we're successful, we're done.
@@ -728,6 +711,7 @@ namespace System.Threading
                         // otherwise retry - we have some kind of race, most likely the prev item is being dequeued
                         if (prevSequenceNumber == position + slotsMask | prevSequenceNumber == position)
                         {
+                            // lock the previous slot (so noone could dequeue past us or pop the prev slot)
                             if (Interlocked.CompareExchange(ref prevSlot.SequenceNumber, prevSequenceNumber + Change, prevSequenceNumber) == prevSequenceNumber)
                             {
                                 // Successfully locked prev slot.
@@ -736,7 +720,7 @@ namespace System.Threading
                                 int sequenceNumber = Volatile.Read(ref slot.SequenceNumber);
 
                                 // The slot is empty and ready for us to enqueue into it.
-                                // NB: it cannot become full, since slot to the left would need to be locked
+                                // NB: it cannot become full, since the slot to the left would need to be locked
                                 if (sequenceNumber == position & !_frozenForEnqueues)
                                 {
                                     slot.Item = item;
@@ -764,7 +748,7 @@ namespace System.Threading
                                     // set Enqueue to throw off anyone else trying to enqueue or pop
                                     // this guarantees that Enqueue will not change and no more items will be added.
                                     _queueEnds.Enqueue = position + FreezeOffset;
-                                    // NB: need a fence after Enqueue store since SequenceNumber should be written to after.
+                                    // NB: need a fence after Enqueue store and before unlocking.
                                     Volatile.Write(ref _frozenForEnqueues, true);
                                 }
 
@@ -778,7 +762,7 @@ namespace System.Threading
                             return false;
                         }
 
-                        // Lost a race. Probably to dequeuer of the last item. Try again. 
+                        // Lost a race. Probably to the dequeuer of the last item. Try again. 
                     }
                 }
 
@@ -796,14 +780,7 @@ namespace System.Threading
                     // Check if the slot is considered Full in the current generation.
                     if (sequenceNumber == position + Full)
                     {
-                        // Reserve the slot.
-                        //
-                        // WARNING:
-                        // The next few lines are not reliable on a runtime that
-                        // supports thread aborts. If a thread abort were to sneak in after the CompareExchange
-                        // but before the write to SequenceNumber, anyone trying to modify this slot would
-                        // spin indefinitely.  If this implementation is ever used on such a platform, this
-                        // if block should be wrapped in a finally / prepared region.
+                        // lock the slot.
                         if (Interlocked.CompareExchange(ref slot.SequenceNumber, position + Change, sequenceNumber) == sequenceNumber)
                         {
                             // confirm that enqueue did not change while we were locking the slot (very rarely we may contend with Pop or Enqueue)
@@ -849,14 +826,14 @@ namespace System.Threading
                     for (; ; )
                     {
                         // we may need this later. Read it now.
-                        var generationGap = _slots.Length;
+                        var slotsMask = _slotsMask;
 
                         // Get the dequeue position.
                         // IMPORTANT: hot path. 
                         //            get from fetching Dequeue to the following Volatile.Write as fast as possible. 
                         //            Lest we will clash with others.
                         int position = _queueEnds.Dequeue;
-                        ref Slot slot = ref GetSlot(_slots, _slotsMask, position);
+                        ref Slot slot = ref GetSlot(_slots, slotsMask, position);
 
                         // Read the sequence number for the cell.
                         int sequenceNumber = slot.SequenceNumber;
@@ -865,13 +842,6 @@ namespace System.Threading
                         if (sequenceNumber == position + Full)
                         {
                             // Reserve the slot for Dequeuing.
-                            //
-                            // WARNING:
-                            // The next few lines are not reliable on a runtime that
-                            // supports thread aborts. If a thread abort were to sneak in after the CompareExchange
-                            // but before the write to SequenceNumber, anyone trying to modify this slot would
-                            // spin indefinitely.  If this implementation is ever used on such a platform, this
-                            // if block should be wrapped in a finally / prepared region.
                             if (Interlocked.CompareExchange(ref slot.SequenceNumber, position + Change, sequenceNumber) == sequenceNumber)
                             {
                                 // Successfully reserved the slot.  Note that after the above CompareExchange, other threads
@@ -887,7 +857,7 @@ namespace System.Threading
 
                                 // make the slot appear empty in the next generation
                                 // unlocks the slot for enqueuing
-                                Volatile.Write(ref slot.SequenceNumber, position + generationGap);
+                                Volatile.Write(ref slot.SequenceNumber, position + 1 + slotsMask);
 
                                 if (item == null)
                                 {
@@ -925,14 +895,7 @@ namespace System.Threading
 
                         if (slot.Item == callback)
                         {
-                            // Reserve the slot.
-                            //
-                            // WARNING:
-                            // The next few lines are not reliable on a runtime that
-                            // supports thread aborts. If a thread abort were to sneak in after the CompareExchange
-                            // but before the write to SequenceNumber, anyone trying to modify this slot would
-                            // spin indefinitely.  If this implementation is ever used on such a platform, this
-                            // if block should be wrapped in a finally / prepared region.
+                            // lock the slot.
                             var fullSlot = position + Full;
                             if (Interlocked.CompareExchange(ref slot.SequenceNumber, position + Change, fullSlot) == fullSlot)
                             {
@@ -955,7 +918,7 @@ namespace System.Threading
                             // lost the item to someone else
                             break;
                         }
-                        else if(slot.SequenceNumber > position + Change)
+                        else if (slot.SequenceNumber - position > Change)
                         {
                             // reached next gen
                             break;
@@ -1013,7 +976,7 @@ namespace System.Threading
 
             if (result == null)
             {
-                var newQueue = new LocalQueue(index);
+                var newQueue = new LocalQueue();
                 Interlocked.CompareExchange(ref localQueues[index], newQueue, null);
                 result = localQueues[index];
             }
@@ -1989,22 +1952,32 @@ namespace System.Threading
             var workQueue = ThreadPoolGlobals.workQueue;
 
             // Enumerate global queue
-            //foreach (IThreadPoolWorkItem workItem in workQueue.workItems)
-            //{
-            //    yield return workItem;
-            //}
+            for (var s = workQueue.globalQueue._deqSegment; s != null; s = s._nextSegment)
+            {
+                foreach (var slot in s._slots)
+                {
+                    IThreadPoolWorkItem item = slot.Item;
+                    if (item != null)
+                    {
+                        yield return item;
+                    }
+                }
+            }
 
             // Enumerate each local queue
             foreach (ThreadPoolWorkQueue.LocalQueue wsq in workQueue.localQueues)
             {
-                for (var head = wsq._deqSegment; head != null; head = head._nextSegment)
+                if (wsq != null)
                 {
-                    foreach (var slot in head._slots)
+                    for (var s = wsq._deqSegment; s != null; s = s._nextSegment)
                     {
-                        IThreadPoolWorkItem item = slot.Item;
-                        if (item != null)
+                        foreach (var slot in s._slots)
                         {
-                            yield return item;
+                            IThreadPoolWorkItem item = slot.Item;
+                            if (item != null)
+                            {
+                                yield return item;
+                            }
                         }
                     }
                 }
@@ -2013,15 +1986,18 @@ namespace System.Threading
 
         internal static IEnumerable<IThreadPoolWorkItem> GetLocallyQueuedWorkItems()
         {
-            ThreadPoolWorkQueue.LocalQueue wsq = ThreadPoolGlobals.workQueue?.GetLocalQueue();
-            for (var head = wsq._deqSegment; head != null; head = head._nextSegment)
+            ThreadPoolWorkQueue.LocalQueue wsq = ThreadPoolGlobals.workQueue.GetLocalQueue();
+            if (wsq != null)
             {
-                foreach (var slot in head._slots)
+                for (var s = wsq._deqSegment; s != null; s = s._nextSegment)
                 {
-                    IThreadPoolWorkItem item = slot.Item;
-                    if (item != null)
+                    foreach (var slot in s._slots)
                     {
-                        yield return item;
+                        IThreadPoolWorkItem item = slot.Item;
+                        if (item != null)
+                        {
+                            yield return item;
+                        }
                     }
                 }
             }
