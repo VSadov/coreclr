@@ -166,9 +166,10 @@ namespace System.Threading
                     {
                         // Read Deq and then Enq. If not the same, there could be work for a dequeuer. 
                         // NB: order of reads is unimportant here. 
-                        //     threads will do interlocked op on dispatch so will observe new items. that is enough for correctness.
+                        //     threads will do interlocked operations on dispatch so will observe new items and that is enough for correctness.
                         //     here if Deq == Enq, we have no work at this point in time.
-                        // NB: frozen segments have artificially increased size and will appear as having work even when there are no items.
+                        // NB: frozen segments have artificially increased Enqueue and will appear as having work even when there are no items.
+                        //     and they indeed require work - at very least to retire them.
                         return _queueEnds.Dequeue != _queueEnds.Enqueue;
                     }
                 }
@@ -195,7 +196,7 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// Adds an object to the top of the <see cref="LocalQueue"/>
+            /// Adds an object to the top of the queue
             /// </summary>
             internal void Enqueue(IThreadPoolWorkItem item)
             {
@@ -210,7 +211,7 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// Adds to the end of the queue, adding a new segment if necessary.
+            /// Slow path for enqueue, adding a new segment if necessary.
             /// </summary>
             private void EnqueueSlow(GlobalQueueSegment currentSegment, IThreadPoolWorkItem item)
             {
@@ -255,7 +256,7 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// Removes an object at the bottom of the <see cref="LocalQueue"/>
+            /// Removes an object at the bottom of the queue
             /// Returns null if the queue is empty.
             /// </summary>
             internal IThreadPoolWorkItem Dequeue()
@@ -273,7 +274,7 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// Tries to dequeue an item, removing empty segments as needed.
+            /// Slow path for Dequeue, removing frozen segments as needed.
             /// </summary>
             private IThreadPoolWorkItem TryDequeueSlow(GlobalQueueSegment currentSegment)
             {
@@ -335,7 +336,9 @@ namespace System.Threading
             /// <summary>
             /// Provides a multi-producer, multi-consumer thread-safe bounded segment.  When the queue is full,
             /// enqueues fail and return false.  When the queue is empty, dequeues fail and return null.
-            /// These segments are linked together to form the unbounded <see cref="LocalQueue"/>. 
+            /// These segments are linked together to form the unbounded queue.
+            /// 
+            /// The "global" flavor of the queue does not support Pop or Remove and that allows for some simplifications.
             /// </summary>
             internal sealed class GlobalQueueSegment : QueueSegmentBase
             {
@@ -475,6 +478,12 @@ namespace System.Threading
             }
         }
 
+        /// <summary>
+        /// The "local" flavor of the queue is similar to the "global", but also supports Pop or Remove 
+        /// operations as needed by the Busy Leaves algorithm.
+        /// 
+        /// We create multiple local queues and softly affinitize them with CPU cores.
+        /// </summary>
         internal sealed class LocalQueue : WorkQueueBase
         {
             /// <summary>The current enqueue segment.</summary>
@@ -490,9 +499,9 @@ namespace System.Threading
                 private Internal.PaddingFor32 pad2;
             }
 
+            // Very cheap random sequence generator. We keep one per-local queue.
             private Rnd _rnd = new Rnd() { val = 6247 };
 
-            // Very cheap random sequence generator.
             // We do not need a lot of randomness, I think even _rnd++ would be fairly good here. 
             // Sequences attached to different queues go out of sync quickly and that could be sufficient.
             // However this sequence is a bit more random at a very modest additional cost.
@@ -516,7 +525,7 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// Adds an object to the end of the <see cref="LocalQueue"/>
+            /// Adds an object to the top of the queue
             /// </summary>
             internal void Enqueue(IThreadPoolWorkItem item)
             {
@@ -531,7 +540,7 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// Adds to the end of the queue, adding a new segment if necessary.
+            /// Slow path for Enqueue, adding a new segment if necessary.
             /// </summary>
             private void EnqueueSlow(LocalQueueSegment currentSegment, IThreadPoolWorkItem item)
             {
@@ -576,17 +585,18 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// Removes an object at the bottom of the <see cref="LocalQueue"/>
-            /// Returns null if the queue is empty.
+            /// Removes an object at the bottom of the queue
+            /// Returns null if the queue is empty or if there is a contention 
+            /// (no point to dwell on one local queue and make problem worse when there are other queues).
             /// </summary>
             internal IThreadPoolWorkItem Dequeue()
             {
                 var currentSegment = _deqSegment;
                 IThreadPoolWorkItem result = currentSegment.TryDequeue();
 
+                // if there is a new segment, we must help with retiring the current.
                 if (result == null && currentSegment._nextSegment != null)
                 {
-                    // slow path that fixes up segments
                     result = TryDequeueSlow(currentSegment);
                 }
 
@@ -594,7 +604,7 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// Tries to dequeue an item, removing empty segments as needed.
+            /// Tries to dequeue an item, removing frozen segments as needed.
             /// </summary>
             private IThreadPoolWorkItem TryDequeueSlow(LocalQueueSegment currentSegment)
             {
@@ -624,7 +634,7 @@ namespace System.Threading
 
                     currentSegment = _deqSegment;
 
-                    // Try to take.  If we're successful, we're done.
+                    // Try to dequeue.  If we're successful, we're done.
                     result = currentSegment.TryDequeue();
                     if (result != null)
                     {
@@ -653,11 +663,19 @@ namespace System.Threading
                 }
             }
 
+            /// <summary>
+            /// Pops an item from the top of the queue.
+            /// Returns null if there is nothing to pop or there is a contention.
+            /// </summary>
             internal IThreadPoolWorkItem TryPop()
             {
                 return this._enqSegment.TryPop();
             }
 
+            /// <summary>
+            /// Performs a limited search for the given item in the queue and removes the item if found.
+            /// Returns true if item was indeed removed.
+            /// </summary>
             internal bool TryRemove(IThreadPoolWorkItem callback)
             {
                 return this._enqSegment.TryRemove(callback);
@@ -666,22 +684,31 @@ namespace System.Threading
             /// <summary>
             /// Provides a multi-producer, multi-consumer thread-safe bounded segment.  When the queue is full,
             /// enqueues fail and return false.  When the queue is empty, dequeues fail and return null.
-            /// These segments are linked together to form the unbounded <see cref="LocalQueue"/>. 
+            /// These segments are linked together to form the unbounded queue.
+            /// 
+            /// The "local" flavor of the queue also supports Pop or Remove operations as needed by the Busy Leaves algorithm.
             /// </summary>
             internal sealed class LocalQueueSegment : QueueSegmentBase
             {
                 /// <summary>The segment following this one in the queue, or null if this segment is the last in the queue.</summary>
                 internal LocalQueueSegment _nextSegment;
 
+                /// <summary>
+                /// Another state of the slot in addition to Empty and Full.
+                /// "Change" means that the slot is reserved for possible modifications.
+                /// The state is used for mutual communication between Enqueue/Dequeue/Pop/Remove.
+                /// NB: Enqueue reserves the slot "to the left" of the slot that is targeted by Enqueue.
+                ///     This ensures that "Full" slots occupy a contiguous range (not a requirement and is not true for the "global" flavor of the queue)
+                /// </summary>
                 private const int Change = 2;
 
                 private const int RemoveRange = 1024;
 
                 /// <summary>Creates the segment.</summary>
-                /// <param name="boundedLength">
+                /// <param name="length">
                 /// The maximum number of elements the segment can contain.  Must be a power of 2.
                 /// </param>
-                internal LocalQueueSegment(int boundedLength) : base(boundedLength) { }
+                internal LocalQueueSegment(int length) : base(length) { }
 
                 /// <summary>
                 /// Attempts to enqueue the item.  If successful, the item will be stored
@@ -698,7 +725,7 @@ namespace System.Threading
 
                         // IMPORTANT: hot path. 
                         //            get from fetching Equeue to the following CmpExch as fast as possible. 
-                        //            Lest we will clash with other enqueuers (only an issue when this is a global queue).
+                        //            Lest we will clash with dequeuers if queue is shallow.
                         // NB: Engueue must be read before SequenceNumber, 
                         //     but the actual read of SequenceNumber is via CAS, so no need for volatile here.
                         //     besides SequenceNumber is a dependent read anyways
@@ -731,7 +758,7 @@ namespace System.Threading
 
                                     // mark slot as full 
                                     // this enables the slot for dequeuing
-                                    // NB: volatile since we need a fence since item and Enqueue stores must be earlier than SequenceNumber
+                                    // NB: we need a fence since Item and Enqueue stores must be earlier than SequenceNumber
                                     Volatile.Write(ref slot.SequenceNumber, position + Full);
 
                                     // unlock prev slot, we are done
@@ -762,7 +789,7 @@ namespace System.Threading
                             return false;
                         }
 
-                        // Lost a race. Probably to the dequeuer of the last item. Try again. 
+                        // Lost a race. Probably to the dequeuer of the last item, which will be done shortly. Try again. 
                     }
                 }
 
@@ -783,7 +810,8 @@ namespace System.Threading
                         // lock the slot.
                         if (Interlocked.CompareExchange(ref slot.SequenceNumber, position + Change, sequenceNumber) == sequenceNumber)
                         {
-                            // confirm that enqueue did not change while we were locking the slot (very rarely we may contend with Pop or Enqueue)
+                            // confirm that enqueue did not change while we were locking the slot 
+                            // it is extremely rare, but we may contend with another Pop or Enqueue, just leave it.
                             // if (_queueEnds.Enqueue - 1 == position)
                             if (_queueEnds.Enqueue == sequenceNumber)
                             {
@@ -815,14 +843,18 @@ namespace System.Threading
                         }
                     }
 
-                    // no items or contention (most likely with a dequeuer) - just return.
+                    // done or found no items or encountered a contention (most likely with a dequeuer) - just return what we have.
                     return item;
                 }
 
-                /// <summary>Tries to dequeue an element from the queue.</summary>
+                /// <summary>
+                /// Tries to dequeue an element from the queue.
+                /// 
+                /// "forceSpin" requires spinning on contentions - used when a frozen segment must be emptied.
+                /// </summary>
                 internal IThreadPoolWorkItem TryDequeue(bool forceSpin = false)
                 {
-                    // Loop in case of contention...
+                    // Loop in case of contention when forceSpin
                     for (; ; )
                     {
                         // we may need this later. Read it now.
@@ -870,14 +902,13 @@ namespace System.Threading
                         }
                         else if (!forceSpin || position == sequenceNumber)
                         {
-                            // reached empty
+                            // reached an empty slot
                             // since full slots are contiguous, finding an empty slot means that 
-                            // at the point when our dequeue value was set the queue was empty 
-                            // or all the values present at the time have been popped.
+                            // for our purposes and for the moment in time the queue is empty 
                             break;
                         }
 
-                        // Lost a race, but are told to ensure the queue is empty before giving up.  
+                        // Lost a race, but are told to ensure the queue is empty before giving up (this is rare).  
                         // try again.
                     }
 
@@ -887,6 +918,10 @@ namespace System.Threading
                     return null;
                 }
 
+                /// <summary>
+                /// Searches for the given callback and removes it.
+                /// Returns "true" if actually removed the item.
+                /// </summary>
                 internal bool TryRemove(IThreadPoolWorkItem callback)
                 {
                     for (int position = _queueEnds.Enqueue - 1, l = position - RemoveRange; position != l; position--)
@@ -906,7 +941,7 @@ namespace System.Threading
                                     slot.Item = null;
 
                                     // unlock the slot
-                                    // NB: must be after erasing the item
+                                    // NB: the write must be after erasing the item
                                     Volatile.Write(ref slot.SequenceNumber, fullSlot);
                                     return true;
                                 }
@@ -1206,11 +1241,10 @@ namespace System.Threading
                     //
                     // If we found work, there may be more work.  Ask for another thread so that the other work can be processed
                     // in parallel.  Note that this will only ask for a max of #procs threads, so it's safe to call it for every dequeue.
-                    //
-
-                    // TODO: VS this seems useless. 
-                    //       is there any scenario sensitive to aggressive ramp up?
-                    //       we are not very sensitive to this, just ask for a thread once in a while
+                    // Repeat the ask after 31 successes.
+                    // NB: we are not very sensitive to the number. It is here just to throttle the rate of requests. 
+                    //     in a theoretical no-limits case the thereads are requested exponentially (new threads ask for more threads, even if only once per quantum),
+                    //     so #procs is saturated quickly when busy.
                     if ((dequeuedItems++ & 31) == 0)
                     {
                         workQueue.RequestThread();
