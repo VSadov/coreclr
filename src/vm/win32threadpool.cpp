@@ -110,7 +110,7 @@ int ThreadpoolMgr::ThreadAdjustmentInterval;
 #define INVALID_HANDLE ((HANDLE) -1)
 #define NEW_THREAD_THRESHOLD            7       // Number of requests outstanding before we start a new thread
 #define CP_THREAD_PENDINGIO_WAIT 5000           // polling interval when thread is retired but has a pending io
-#define GATE_THREAD_DELAY 500 /*milliseconds*/
+#define GATE_THREAD_DELAY 200 /*milliseconds*/
 #define GATE_THREAD_DELAY_TOLERANCE 50 /*milliseconds*/
 #define DELAY_BETWEEN_SUSPENDS 5000 + GATE_THREAD_DELAY // time to delay between suspensions
 #define SUSPEND_TIME GATE_THREAD_DELAY+100      // milliseconds to suspend during SuspendProcessing
@@ -4435,6 +4435,14 @@ BOOL ThreadpoolMgr::SufficientDelaySinceLastDequeue()
     if(cpuUtilization < CpuUtilizationLow)
     {
         tooLong = GATE_THREAD_DELAY;
+
+        // when running low thread counts, be a bit more sensitive to delays 
+        // since effects of starvation are more significant.
+        int maxWorking = WorkerCounter.DangerousGetDirtyCounts().MaxWorking;
+        if (maxWorking < 16)
+        {
+            tooLong = tooLong * maxWorking / 16;
+        }
     }
     else       
     {
