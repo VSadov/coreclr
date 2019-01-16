@@ -989,8 +989,10 @@ void ThreadpoolMgr::AdjustMaxWorkersActive()
 
         PriorCompletedWorkRequests = totalNumCompletions;
         NextCompletedWorkRequestsTime = currentTicks + ThreadAdjustmentInterval;
-        MemoryBarrier(); // flush previous writes (especially NextCompletedWorkRequestsTime)
-        PriorCompletedWorkRequestsTime = currentTicks;
+        // make sure that NextCompletedWorkRequestsTime is updated before PriorCompletedWorkRequestsTime
+        // so that reader never sees newer PriorCompletedWorkRequestsTime while having stale NextCompletedWorkRequestsTime
+        // NB: we are holding the ThreadAdjustmentLock and therefore the order cannot be violated by two threads writing.
+        VolatileStore(&PriorCompletedWorkRequestsTime, currentTicks);
         CurrentSampleStartTime = endTime;;
     }
 }
