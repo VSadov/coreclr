@@ -850,8 +850,10 @@ public:
     {
         WRAPPER_NO_CONTRACT;
 
-        DWORD priorTime = PriorCompletedWorkRequestsTime;
-        MemoryBarrier(); // read fresh value for NextCompletedWorkRequestsTime below
+        // make sure that PriorCompletedWorkRequestsTime is read before NextCompletedWorkRequestsTime
+        // to make sure that NextCompletedWorkRequestsTime is not older than PriorCompletedWorkRequestsTime
+        // NB: we write them in reverse order while holding a lock.
+        DWORD priorTime = VolatileLoad(&PriorCompletedWorkRequestsTime);
         DWORD requiredInterval = NextCompletedWorkRequestsTime - priorTime;
         DWORD elapsedInterval = GetTickCount() - priorTime;
         if (elapsedInterval >= requiredInterval)
