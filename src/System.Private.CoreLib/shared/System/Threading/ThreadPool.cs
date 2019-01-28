@@ -145,7 +145,7 @@ namespace System.Threading
                         slots[i].SequenceNumber = i;
                     }
 
-                    this._slots = slots;
+                    _slots = slots;
                 }
 
                 /// <summary>Represents a slot in the queue.</summary>
@@ -350,7 +350,7 @@ namespace System.Threading
             {
                 get
                 {
-                    return this._deqSegment.CanSteal;
+                    return _deqSegment.CanSteal;
                 }
             }
 
@@ -476,8 +476,8 @@ namespace System.Threading
                             // Check if we have reached Enqueue and return null.
                             // Otherwise spin.
                             // NB: reading stale _frozenForEnqueues is fine - we would just spin once more
-                            var currentEnqueue = this._queueEnds.Enqueue;
-                            if (currentEnqueue == position || (this._frozenForEnqueues && currentEnqueue == position + FreezeOffset))
+                            var currentEnqueue = _queueEnds.Enqueue;
+                            if (currentEnqueue == position || (_frozenForEnqueues && currentEnqueue == position + FreezeOffset))
                             {
                                 return null;
                             }
@@ -691,7 +691,7 @@ namespace System.Threading
             /// </summary>
             internal object TryPop()
             {
-                return this._enqSegment.TryPop();
+                return _enqSegment.TryPop();
             }
 
             /// <summary>
@@ -700,7 +700,7 @@ namespace System.Threading
             /// </summary>
             internal bool TryRemove(object callback)
             {
-                return this._enqSegment.TryRemove(callback);
+                return _enqSegment.TryRemove(callback);
             }
 
             /// <summary>
@@ -825,13 +825,13 @@ namespace System.Threading
 
                 internal object TryPop()
                 {
+                    for (; ; )
+                    {
+                        int position = _queueEnds.Enqueue - 1;
+                        ref Slot slot = ref this[position];
 
-                tryAgain:
-                    int position = _queueEnds.Enqueue - 1;
-                    ref Slot slot = ref this[position];
-
-                    // Read the sequence number for the cell.
-                    int sequenceNumber = slot.SequenceNumber;
+                        // Read the sequence number for the cell.
+                        int sequenceNumber = slot.SequenceNumber;
 
                         // Check if the slot is considered Full in the current generation (other likely state - Empty).
                         if (sequenceNumber == position + Full)
@@ -847,34 +847,36 @@ namespace System.Threading
                                     var item = slot.Item;
                                     slot.Item = null;
 
-                                // update Enqueue before marking slot empty. - if enqueue update is later than that it may happen after the slot is enqueued.
-                                _queueEnds.Enqueue = position;
+                                    // update Enqueue before marking slot empty. - if enqueue update is later than that it may happen after the slot is enqueued.
+                                    _queueEnds.Enqueue = position;
 
-                                // make the slot appear empty in the current generation and update enqueue
-                                // that unlocks the slot
-                                Volatile.Write(ref slot.SequenceNumber, position);
+                                    // make the slot appear empty in the current generation and update enqueue
+                                    // that unlocks the slot
+                                    Volatile.Write(ref slot.SequenceNumber, position);
 
-                                if (item == null)
-                                {
-                                    // item was removed
-                                    // this is not a lost race though, so continue.
-                                    goto tryAgain;
+                                    if (item == null)
+                                    {
+                                        // item was removed
+                                        // this is not a lost race though, so continue.
+                                        continue;
+                                    }
+
+                                    return item;
                                 }
-
-                                return item;
-                            }
-                            else
-                            {
-                                // enqueue changed, in this rare case we just retry
-                                // unlock the slot through CAS in case the slot was robbed
-                                Interlocked.CompareExchange(ref slot.SequenceNumber, sequenceNumber, position + Change);
-                                goto tryAgain;
+                                else
+                                {
+                                    // enqueue changed, in this rare case we just retry
+                                    // unlock the slot through CAS in case the slot was robbed
+                                    // and try again
+                                    Interlocked.CompareExchange(ref slot.SequenceNumber, sequenceNumber, position + Change);
+                                    continue;
+                                }
                             }
                         }
-                    }
 
-                    // found no items or encountered a contention (most likely with a dequeuer)
-                    return null;
+                        // found no items or encountered a contention (most likely with a dequeuer)
+                        return null;
+                    }
                 }
 
                 /// <summary>
@@ -887,58 +889,59 @@ namespace System.Threading
                 /// </summary>
                 internal object TryDequeue(ref bool missedSteal)
                 {
-                    tryAgain:
-
-                    int position = _queueEnds.Dequeue;
-                    ref Slot slot = ref this[position];
-
-                    // Read the sequence number for the cell.
-                    int sequenceNumber = slot.SequenceNumber;
-
-                    // Check if the slot is considered Full in the current generation.
-                    if (sequenceNumber == position + Full)
+                    for (; ; )
                     {
-                        // Reserve the slot for Dequeuing.
-                        if (Interlocked.CompareExchange(ref slot.SequenceNumber, position + Change, sequenceNumber) == sequenceNumber)
+                        int position = _queueEnds.Dequeue;
+                        ref Slot slot = ref this[position];
+
+                        // Read the sequence number for the cell.
+                        int sequenceNumber = slot.SequenceNumber;
+
+                        // Check if the slot is considered Full in the current generation.
+                        if (sequenceNumber == position + Full)
                         {
-                            object item;
-                            var enqPos = _queueEnds.Enqueue;
-
-                            if (enqPos - position < RichCount ||
-                                // take from the rich and give to the needy
-                                // NB: "this" is a sentinel for a failed robbing attempt
-                                (item = TryRob(position, enqPos)) == this)
+                            // Reserve the slot for Dequeuing.
+                            if (Interlocked.CompareExchange(ref slot.SequenceNumber, position + Change, sequenceNumber) == sequenceNumber)
                             {
-                                _queueEnds.Dequeue = position + 1;
-                                item = slot.Item;
-                                slot.Item = null;
+                                object item;
+                                var enqPos = _queueEnds.Enqueue;
+
+                                if (enqPos - position < RichCount ||
+                                    // take from the rich and give to the needy
+                                    // NB: "this" is a sentinel for a failed robbing attempt
+                                    (item = TryRob(position, enqPos)) == this)
+                                {
+                                    _queueEnds.Dequeue = position + 1;
+                                    item = slot.Item;
+                                    slot.Item = null;
+                                }
+
+                                // unlock the slot for enqueuing by making the slot empty in the next generation
+                                Volatile.Write(ref slot.SequenceNumber, position + 1 + _slotsMask);
+
+                                if (item == null)
+                                {
+                                    // the item was removed, so we have nothing to return. 
+                                    // this is not a lost race though, so must continue.
+                                    continue;
+                                }
+
+                                return item;
                             }
-
-                            // unlock the slot for enqueuing by making the slot empty in the next generation
-                            Volatile.Write(ref slot.SequenceNumber, position + 1 + _slotsMask);
-
-                            if (item == null)
-                            {
-                                // the item was removed, so we have nothing to return. 
-                                // this is not a lost race though, so must continue.
-                                goto tryAgain;
-                            }
-
-                            return item;
                         }
-                    }
-                    else if (position == sequenceNumber)
-                    {
-                        // reached an empty slot
-                        // since full slots are contiguous, finding an empty slot means that 
-                        // for our purposes and for the moment in time the queue is empty 
+                        else if (position == sequenceNumber)
+                        {
+                            // reached an empty slot
+                            // since full slots are contiguous, finding an empty slot means that 
+                            // for our purposes and for the moment in time the queue is empty 
+                            return null;
+                        }
+
+                        // contention with other thread
+                        // must check this segment again later                   
+                        missedSteal = true;
                         return null;
                     }
-
-                    // contention with other thread
-                    // must check this segment again later                   
-                    missedSteal = true;
-                    return null;
                 }
 
                 object TryRob(int deqPosition, int enqPosition)
@@ -975,7 +978,7 @@ namespace System.Threading
                                         // our enqueue could have changed before we locked half
                                         // make sure that half-way slot is still before enqueue
                                         // in fact give it more space - we do not want to rob all the items, especially if it is popping them fast.
-                                        var enq = deqPosition + ((this._queueEnds.Enqueue - deqPosition) & _slotsMask);
+                                        var enq = deqPosition + ((_queueEnds.Enqueue - deqPosition) & _slotsMask);
                                         if (enq - halfPosition > (RichCount / 4))
                                         {
                                             int i = deqPosition, j = otherEnqPosition;
@@ -1022,7 +1025,7 @@ namespace System.Threading
                                             other._queueEnds.Enqueue = j;
 
                                             // advance Dequeue, must be after halfSlot is restored - someone could immediately start robbing.
-                                            Volatile.Write(ref this._queueEnds.Dequeue, i);
+                                            Volatile.Write(ref _queueEnds.Dequeue, i);
 
                                             // unlock other prev slot
                                             // must be after we moved other enq to the next slot, or someone may pop prev and break continuity of full slots.
@@ -1259,7 +1262,7 @@ namespace System.Threading
             object callback = _globalQueue.Dequeue();
             if (callback != null)
             {
-                goto done;
+                return callback;
             }
 
             LocalQueue[] queues = _localQueues;
@@ -1287,11 +1290,10 @@ namespace System.Threading
                 callback = localWsq?.Dequeue(ref missedSteal);
                 if (callback != null)
                 {
-                    goto done;
+                    break;
                 }
             }
 
-        done:
             return callback;
         }
 
@@ -1366,7 +1368,7 @@ namespace System.Threading
                 do
                 {
                     bool missedSteal = false;
-                    object workItem = outerWorkItem = workQueue.PopLocal(localQueueIndex) ?? workQueue.DequeueAny(ref missedSteal, localQueueIndex);
+                    object workItem = workQueue.PopLocal(localQueueIndex) ?? workQueue.DequeueAny(ref missedSteal, localQueueIndex);
 
                     if (workItem == null)
                     {
@@ -1446,10 +1448,10 @@ namespace System.Threading
                         Unsafe.As<IThreadPoolWorkItem>(workItem).Execute();
                     }
 
-                    currentThread.ResetThreadPoolThread();
-
                     // Release refs
-                    outerWorkItem = workItem = null;
+                    workItem = null;
+
+                    currentThread.ResetThreadPoolThread();
 
                     // Return to clean ExecutionContext and SynchronizationContext
                     ExecutionContext.ResetThreadPoolThread(currentThread);
@@ -1473,7 +1475,7 @@ namespace System.Threading
                 // Make a request for a thread (up to #proc) to account for our leaving.
                 //
                 if (needAnotherThread)
-                    workQueue.RequestThread();
+                    outerWorkQueue.RequestThread();
             }
         }
     }
