@@ -168,20 +168,6 @@ namespace System.Threading
                     }
                 }
 
-                internal bool CanSteal
-                {
-                    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-                    get
-                    {
-                        // Read Deq and then Enq. If not the same, there could be work for a dequeuer. 
-                        // Order of reads is unimportant here since if there is work we are responsible for, we must see it.
-                        //
-                        // NB: Frozen segments have artificially increased Enqueue and will appear as having work even when there are no items.
-                        //     And they indeed require work - at very least to retire them.
-                        return _queueEnds.Dequeue != _queueEnds.Enqueue;
-                    }
-                }
-
                 /// <summary>Gets the "freeze offset" for this segment.</summary>
                 internal int FreezeOffset => _slots.Length * 2;
             }
@@ -278,7 +264,7 @@ namespace System.Threading
             internal object Dequeue()
             {
                 var currentSegment = _deqSegment;
-                if (!currentSegment.CanSteal)
+                if (currentSegment.IsEmpty)
                 {
                     return null;
                 }
@@ -342,19 +328,6 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// Returns true if an item can be dequeued.
-            /// There are no gurantees, obviously, since the queue may concurrently change. Just a cheap check.
-            /// NB: frozen segment always reports "CanSteal"
-            /// </summary>
-            internal bool CanSteal
-            {
-                get
-                {
-                    return _deqSegment.CanSteal;
-                }
-            }
-
-            /// <summary>
             /// Provides a multi-producer, multi-consumer thread-safe bounded segment.  When the queue is full,
             /// enqueues fail and return false.  When the queue is empty, dequeues fail and return null.
             /// These segments are linked together to form the unbounded queue.
@@ -375,6 +348,20 @@ namespace System.Threading
 
                 // for debugging
                 internal int Count => _queueEnds.Enqueue - _queueEnds.Dequeue;
+
+                internal bool IsEmpty
+                {
+                    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+                    get
+                    {
+                        // Read Deq and then Enq. If not the same, there could be work for a dequeuer. 
+                        // Order of reads is unimportant here since if there is work we are responsible for, we must see it.
+                        //
+                        // NB: Frozen segments have artificially increased Enqueue and will appear as having work even when there are no items.
+                        //     And they indeed require work - at very least to retire them.
+                        return _queueEnds.Dequeue == _queueEnds.Enqueue;
+                    }
+                }
 
                 /// <summary>
                 /// Attempts to enqueue the item.  If successful, the item will be stored
@@ -414,7 +401,7 @@ namespace System.Threading
                         }
 
                         // Lost a race. Spin a bit, then try again.
-                        spinner.SpinOnce();
+                        spinner.SpinOnce(sleep1Threshold: -1);
                     }
                 }
 
@@ -423,20 +410,10 @@ namespace System.Threading
                     // flag used to ensure we don't increase the enqueue more than once
                     if (!_frozenForEnqueues)
                     {
-                        // Increase the enqueue by FreezeOffset, spinning until we're successful in doing so.
+                        // Increase the enqueue by FreezeOffset atomically.
                         // enqueuing will be impossible after that
                         // dequeuers would need to dequeue 2 generations to catch up, and they can't
-                        var spinner = new SpinWait();
-                        for (; ; )
-                        {
-                            int enqueue = _queueEnds.Enqueue;
-                            if (Interlocked.CompareExchange(ref _queueEnds.Enqueue, enqueue + FreezeOffset, enqueue) == enqueue)
-                            {
-                                break;
-                            }
-                            spinner.SpinOnce();
-                        }
-
+                        Interlocked.Add(ref _queueEnds.Enqueue, FreezeOffset);
                         _frozenForEnqueues = true;
                     }
                 }
@@ -484,7 +461,7 @@ namespace System.Threading
                         }
 
                         // Lost a race. Spin a bit, then try again.
-                        spinner.SpinOnce();
+                        spinner.SpinOnce(sleep1Threshold: -1);
                     }
                 }
             }
@@ -933,7 +910,7 @@ namespace System.Threading
                         {
                             // reached an empty slot
                             // since full slots are contiguous, finding an empty slot means that 
-                            // for our purposes and for the moment in time the queue is empty 
+                            // for our purposes and for the moment in time the segment is empty 
                             return null;
                         }
 
@@ -941,6 +918,21 @@ namespace System.Threading
                         // must check this segment again later                   
                         missedSteal = true;
                         return null;
+                    }
+                }
+
+                internal bool IsEmpty
+                {
+                    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+                    get
+                    {
+                        int position = _queueEnds.Dequeue;
+                        int sequenceNumber = this[position].SequenceNumber;
+
+                        // "position == sequenceNumber" means that we have reached an empty slot.
+                        // since full slots are contiguous, finding an empty slot means that 
+                        // for our purposes and for the moment in time the segment is empty 
+                        return position == sequenceNumber;
                     }
                 }
 
@@ -1170,25 +1162,7 @@ namespace System.Threading
         internal void EnsureThreadRequested()
         {
             //
-            // Note that there is a separate count in the VM which will also be incremented in this case, 
-            // which is handled by RequestWorkerThread
-            //           
-            int count = numOutstandingThreadRequests;
-            if (count == 0)
-            {
-                int prev = Interlocked.CompareExchange(ref numOutstandingThreadRequests, 1, 0);
-                if (prev == 0)
-                {
-                    ThreadPool.RequestWorkerThread();
-                }
-            }
-        }
-
-        internal void RequestThread()
-        {
-            //
-            // If we have not yet requested #procs threads from the VM, then request a new thread
-            // as needed
+            // If we have not yet requested #procs threads, then request a new thread.
             //
             // CoreCLR: Note that there is a separate count in the VM which has already been incremented
             // by the VM by the time we reach this point.
@@ -1260,37 +1234,26 @@ namespace System.Threading
         public object DequeueAny(ref bool missedSteal, int localQueueIndex)
         {
             object callback = _globalQueue.Dequeue();
-            if (callback != null)
+            if (callback == null)
             {
-                return callback;
-            }
 
-            LocalQueue[] queues = _localQueues;
-            LocalQueue localWsq = queues[localQueueIndex];
-            if (localWsq != null)
-            {
-                localQueueIndex = localWsq.NextRnd() & (queues.Length - 1);
-            }
-
-            // then traverse all local queues starting with those that differ in lower bits and going gradually up.
-            // this way we want to minimize chances that two threads concurrently go through the same sequence of queues.
-            for (int i = 0; i < queues.Length; i++)
-            {
-                localWsq = queues[localQueueIndex ^ i];
-
-                //NB: it is tempting to introduce CanSteal to short-circuit, but that, in theory, could lead to incorrect behavior.
-                //    When we are here, modifications that we are expected to pick could still be in the other core's store buffer,
-                //    outside of cache coherence domain.
-                //    This is basically the result of the rare "read after write" case where even x86/64 requires an actual fence.
-                //
-                //    We could ensure that all item writes are globally visible by:
-                //    - having a full fence before checking numOutstandingThreadRequests in EnsureThreasRequested (expensive), or
-                //    - spinning in TryDequeue until we see a consistent state (equally expensive, it just takes time for writes to "happen")
-                //    Instead we detect inconsistent states and make a note of "unfinished business" via missedSteal while moving on to the next queue.
-                callback = localWsq?.Dequeue(ref missedSteal);
-                if (callback != null)
+                LocalQueue[] queues = _localQueues;
+                LocalQueue localWsq = queues[localQueueIndex];
+                if (localWsq != null)
                 {
-                    break;
+                    localQueueIndex = localWsq.NextRnd() & (queues.Length - 1);
+                }
+
+                // then traverse all local queues starting with those that differ in lower bits and going gradually up.
+                // this way we want to minimize chances that two threads concurrently go through the same sequence of queues.
+                for (int i = 0; i < queues.Length; i++)
+                {
+                    localWsq = queues[localQueueIndex ^ i];
+                    callback = localWsq?.Dequeue(ref missedSteal);
+                    if (callback != null)
+                    {
+                        break;
+                    }
                 }
             }
 
@@ -1361,10 +1324,11 @@ namespace System.Threading
                 // refresh proc ID for the new quantum.
                 // also, since we are coming from the VM, we could have a context switch when going through the semaphore.
                 var localQueueIndex = workQueue.GetLocalQueueIndex(Threading.Thread.RefreshCurrentProcessorId());
-             
+
                 //
                 // Loop until our quantum expires or there is no work.
                 //
+                var spinner = new SpinWait();
                 do
                 {
                     bool missedSteal = false;
@@ -1372,14 +1336,15 @@ namespace System.Threading
 
                     if (workItem == null)
                     {
-                        //
-                        // Stale data or contention. Proceed to the exit, but make sure someone is coming to take another look.
-                        //
                         if (missedSteal)
                         {
-                            workQueue.EnsureThreadRequested();
+                            // We could not get an item, but saw queues with dequeue/enqueue in progress.
+                            // so back off a little and try again (as long as quantum has not expired)
+                            spinner.SpinOnce();
+                            continue;
                         }
 
+                        // at this point in time there is no work, return the thread.
                         needAnotherThread = false;
 
                         // Tell the VM we're returning normally, not because Hill Climbing asked us to return.
@@ -1392,21 +1357,7 @@ namespace System.Threading
                     //
                     // We are about to execute external code, which can take a while, block or even wait on something from other tasks.
                     // Make sure there is a request, in case we do not come back for long while.
-                    //
-                    // If we execute more than one task per quantum, ask for an aditional thread (up to #procs) on the first success and 
-                    // every 1024 successes thereafter.
-                    // NB: we are not very sensitive to the number. It is here just to throttle the rate of additional expansion requests. 
-                    //     The number of cycles per quantum can be in 100K range if tasks are "easy", so no need to be too aggressive here. 
-                    //     New workers will ask for more spinners if there is work, and stay around themselves, 
-                    //     so #procs is saturated quickly when pool is busy.                    
-                    if ((dequeueCycles++ & 1023) == 0)
-                    {
-                        workQueue.RequestThread();
-                    }
-                    else
-                    {
-                        workQueue.EnsureThreadRequested();
-                    }
+                    workQueue.EnsureThreadRequested();
 
                     //
                     // Execute the workitem outside of any finally blocks, so that it can be aborted if needed.
@@ -1475,7 +1426,7 @@ namespace System.Threading
                 // Make a request for a thread (up to #proc) to account for our leaving.
                 //
                 if (needAnotherThread)
-                    outerWorkQueue.RequestThread();
+                    ThreadPoolGlobals.workQueue.EnsureThreadRequested();
             }
         }
     }
