@@ -869,9 +869,21 @@ namespace System.Threading
                     for (; ; )
                     {
                         int position = _queueEnds.Dequeue;
-                        ref Slot slot = ref this[position];
+
+                        // if prev is not empty (in next generation), there might be more work in the segment.
+                        // NB: enqueues are initiated by locking the prev slot.
+                        //     it is unkikely, but theoretically possible that we will arrive here and see only that, 
+                        //     while other changes are still write-buffered.
+                        //     We cannot claim that the queue is empty, and should report this as a missed steal
+                        //     lest we risk that noone comes for this workitem, ever... 
+                        //     Also must make sure we read the prev slot before the actual slot, reading after is pointless.
+                        if (!missedSteal)
+                        {
+                            missedSteal = Volatile.Read(ref this[position - 1].SequenceNumber) != (position + _slotsMask);
+                        }
 
                         // Read the sequence number for the cell.
+                        ref Slot slot = ref this[position];
                         int sequenceNumber = slot.SequenceNumber;
 
                         // Check if the slot is considered Full in the current generation.
