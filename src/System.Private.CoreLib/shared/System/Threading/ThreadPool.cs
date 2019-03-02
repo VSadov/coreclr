@@ -401,7 +401,7 @@ namespace System.Threading
                         }
 
                         // Lost a race. Spin a bit, then try again.
-                        spinner.SpinOnce(sleep1Threshold: -1);
+                        spinner.SpinOnce();
                     }
                 }
 
@@ -461,7 +461,7 @@ namespace System.Threading
                         }
 
                         // Lost a race. Spin a bit, then try again.
-                        spinner.SpinOnce(sleep1Threshold: -1);
+                        spinner.SpinOnce();
                     }
                 }
             }
@@ -1113,6 +1113,7 @@ namespace System.Threading
 
         private Internal.PaddingFor32 pad1;
         private int numOutstandingThreadRequests = 0;
+        private int maxOutstandingThreadRequests = ThreadPoolGlobals.processorCount;
         private Internal.PaddingFor32 pad2;
 
         internal ThreadPoolWorkQueue()
@@ -1174,10 +1175,35 @@ namespace System.Threading
         internal void EnsureThreadRequested()
         {
             //
-            // If we have not yet requested #procs threads, then request a new thread.
+            // If we have not yet requested #ThreadPoolGlobals.maxOutstandingRequests threads, then request a new thread.
             //
-            // CoreCLR: Note that there is a separate count in the VM which has already been incremented
-            // by the VM by the time we reach this point.
+            int count = numOutstandingThreadRequests;
+            while (count < maxOutstandingThreadRequests)
+            {
+                int prev = Interlocked.CompareExchange(ref numOutstandingThreadRequests, count + 1, count);
+                if (prev == count)
+                {
+                    ThreadPool.RequestWorkerThread();
+                    break;
+                }
+
+                count = prev;
+
+                // collision!!!
+                // When N threads clash here, only 1 makes a progress, and N - 1 try again, and so on, with more threads possibly joining.
+                // This can get pretty expensive on machines with lots of cores, so we will react by lowering the limit.
+                //
+                // NB: Correctness of "EnsureThreadRequested" requires only 1 request. 
+                //     We generally allow more for faster wake up when tasks come in bursts, but here we clearly have a lot of workers.
+                //     We will try rebiasing the limit upwards once threads start leaving (see code in Dispatch).
+                maxOutstandingThreadRequests = Math.Max(maxOutstandingThreadRequests / 2, 1);
+            }
+        }
+
+        internal void RequestThread()
+        {
+            //
+            // If we have not yet requested #procs threads, then request a new thread.
             //
             int count = numOutstandingThreadRequests;
             while (count < ThreadPoolGlobals.processorCount)
@@ -1188,6 +1214,7 @@ namespace System.Threading
                     ThreadPool.RequestWorkerThread();
                     break;
                 }
+
                 count = prev;
             }
         }
@@ -1356,8 +1383,13 @@ namespace System.Threading
                             continue;
                         }
 
-                        // at this point in time there is no work, return the thread.
+                        // at this point in time there is no work, return the thread.           
                         needAnotherThread = false;
+
+                        // increment the limit of outstanding requests. 
+                        // Any number between 1 and #procs is ok. We do not need precision.
+                        // We just want to have a bias towards the number of workers once a task burst is over and all workers have exited.
+                        workQueue.maxOutstandingThreadRequests = Math.Min(workQueue.maxOutstandingThreadRequests + 1, ThreadPoolGlobals.processorCount);
 
                         // Tell the VM we're returning normally, not because Hill Climbing asked us to return.
                         return true;
@@ -1438,7 +1470,7 @@ namespace System.Threading
                 // Make a request for a thread (up to #proc) to account for our leaving.
                 //
                 if (needAnotherThread)
-                    ThreadPoolGlobals.workQueue.EnsureThreadRequested();
+                    ThreadPoolGlobals.workQueue.RequestThread();
             }
         }
     }
