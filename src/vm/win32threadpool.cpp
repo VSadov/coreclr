@@ -96,14 +96,14 @@ LONG    ThreadpoolMgr::cpuUtilizationAverage = 0;
 
 HillClimbing ThreadpoolMgr::HillClimbingInstance;
 
-// Cacheline aligned, 3 hot variables updated in a group
+// Cacheline aligned, 4 hot variables updated in a group
 DECLSPEC_ALIGN(MAX_CACHE_LINE_SIZE) LONG ThreadpoolMgr::PriorCompletedWorkRequests = 0;
 DWORD ThreadpoolMgr::PriorCompletedWorkRequestsTime;
 DWORD ThreadpoolMgr::NextCompletedWorkRequestsTime;
-
 LARGE_INTEGER ThreadpoolMgr::CurrentSampleStartTime;
 
-unsigned int ThreadpoolMgr::WorkerThreadSpinLimit;
+// Move frequently read variable out of from preceeding variables' cache line
+DECLSPEC_ALIGN(MAX_CACHE_LINE_SIZE) unsigned int ThreadpoolMgr::WorkerThreadSpinLimit;
 bool ThreadpoolMgr::IsHillClimbingDisabled;
 int ThreadpoolMgr::ThreadAdjustmentInterval;
 

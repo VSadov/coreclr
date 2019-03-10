@@ -1020,10 +1020,10 @@ private:
     DECLSPEC_ALIGN(MAX_CACHE_LINE_SIZE) static LONG PriorCompletedWorkRequests;
     static DWORD PriorCompletedWorkRequestsTime;
     static DWORD NextCompletedWorkRequestsTime;
-
     static LARGE_INTEGER CurrentSampleStartTime;
 
-    static unsigned int WorkerThreadSpinLimit;
+    // Move out of from preceeding variables' cache line
+    DECLSPEC_ALIGN(MAX_CACHE_LINE_SIZE) static unsigned int WorkerThreadSpinLimit;
     static bool IsHillClimbingDisabled;
     static int ThreadAdjustmentInterval;
 
