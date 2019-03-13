@@ -732,10 +732,9 @@ namespace System.Threading
                     int position = _queueEnds.Enqueue;
                     for (; ; )
                     {
-                        ref Slot slot = ref this[position];
                         ref Slot prevSlot = ref this[position - 1];
-
                         int prevSequenceNumber = prevSlot.SequenceNumber;
+                        ref Slot slot = ref this[position];
 
                         // check if prev slot is empty in the next generation or full
                         // otherwise retry - we have some kind of race, most likely the prev item is being dequeued
@@ -842,9 +841,8 @@ namespace System.Threading
                                 }
                                 else
                                 {
-                                    // enqueue changed, in this rare case we just retry
+                                    // enqueue changed, in this rare case we just retry.
                                     // unlock the slot through CAS in case the slot was robbed
-                                    // and try again
                                     Interlocked.CompareExchange(ref slot.SequenceNumber, sequenceNumber, position + Change);
                                     continue;
                                 }
@@ -1270,24 +1268,19 @@ namespace System.Threading
             return _localQueues[localQueueIndex]?.TryPop();
         }
 
-        public object DequeueAny(ref bool missedSteal, int localQueueIndex)
+        public object DequeueAny(ref bool missedSteal, LocalQueue localQueue)
         {
             object callback = _globalQueue.Dequeue();
             if (callback == null)
             {
-
                 LocalQueue[] queues = _localQueues;
-                LocalQueue localWsq = queues[localQueueIndex];
-                if (localWsq != null)
-                {
-                    localQueueIndex = localWsq.NextRnd() & (queues.Length - 1);
-                }
+                int localQueueIndex = (localQueue?.NextRnd() ?? 0) & _localQueues.Length - 1;
 
                 // then traverse all local queues starting with those that differ in lower bits and going gradually up.
                 // this way we want to minimize chances that two threads concurrently go through the same sequence of queues.
                 for (int i = 0; i < queues.Length; i++)
                 {
-                    localWsq = queues[localQueueIndex ^ i];
+                    var localWsq = queues[localQueueIndex ^ i];
                     callback = localWsq?.Dequeue(ref missedSteal);
                     if (callback != null)
                     {
@@ -1360,18 +1353,16 @@ namespace System.Threading
                 // Use operate on workQueue local to try block so it can be enregistered 
                 ThreadPoolWorkQueue workQueue = ThreadPoolGlobals.workQueue;
 
-                // refresh proc ID for the new quantum.
-                // also, since we are coming from the VM, we could have a context switch when going through the semaphore.
-                var localQueueIndex = workQueue.GetLocalQueueIndex(Threading.Thread.RefreshCurrentProcessorId());
-
                 //
                 // Loop until our quantum expires or there is no work.
                 //
                 var spinner = new SpinWait();
                 do
                 {
+                    var localQueue = workQueue.GetLocalQueue();
+
                     bool missedSteal = false;
-                    object workItem = workQueue.PopLocal(localQueueIndex) ?? workQueue.DequeueAny(ref missedSteal, localQueueIndex);
+                    object workItem = localQueue?.TryPop() ?? workQueue.DequeueAny(ref missedSteal, localQueue);
 
                     if (workItem == null)
                     {
@@ -1443,9 +1434,6 @@ namespace System.Threading
                         Unsafe.As<IThreadPoolWorkItem>(workItem).Execute();
                     }
 
-                    // Release refs
-                    workItem = null;
-
                     currentThread.ResetThreadPoolThread();
 
                     // Return to clean ExecutionContext and SynchronizationContext
@@ -1471,6 +1459,10 @@ namespace System.Threading
                 //
                 if (needAnotherThread)
                     ThreadPoolGlobals.workQueue.RequestThread();
+
+                // we are releasing the thread back to VM or the thread has run for a full quantum.
+                // in either case it makes sense to flush the cached core Id.
+                Thread.FlushCurrentProcessorId();
             }
         }
     }
