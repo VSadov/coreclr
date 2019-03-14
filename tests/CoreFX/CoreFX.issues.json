@@ -1657,6 +1657,20 @@
         }
     },
     {
+        "name": "System.Net.Security.Tests",
+        "enabled": true,
+        "exclusions": {
+            "namespaces": null,
+            "classes": null,
+            "methods": [
+                {
+                    "name": "System.Net.Security.Tests.SslStreamCredentialCacheTest.SslStream_SameCertUsedForClientAndServer_Ok",
+                    "reason": "https://github.com/dotnet/corefx/pull/35373"
+                }
+            ]
+        }
+    },
+    {
         "name": "System.CodeDom.Tests",
         "enabled": true,
         "exclusions": {
