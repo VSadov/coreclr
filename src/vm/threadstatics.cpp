@@ -42,6 +42,11 @@ void ThreadLocalBlock::FreeTLM(SIZE_T i, BOOL isThreadShuttingdown)
 
     if (pThreadLocalModule != NULL)
     {
+        if (m_lastTLM == pThreadLocalModule)
+        {
+            m_lastIndex = ModuleIndex(-1);
+        }
+
         if (pThreadLocalModule->m_pDynamicClassTable != NULL)
         {
             for (DWORD k = 0; k < pThreadLocalModule->m_aDynamicEntries; ++k)

@@ -202,6 +202,10 @@ struct ThreadLocalBlock
     friend class ClrDataAccess;
 
 private:
+    ModuleIndex             m_lastIndex;
+    DWORD                   m_lastDomainID;
+    PTR_ThreadLocalModule   m_lastTLM;
+
     PTR_TLMTableEntry   m_pTLMTable;     // Table of ThreadLocalModules
     SIZE_T              m_TLMTableSize;  // Current size of table
     SpinLock            m_TLMTableLock;  // Spinlock used to synchronize growing the table and freeing TLM by other threads
@@ -238,7 +242,7 @@ public:
 
 #ifndef DACCESS_COMPILE
     ThreadLocalBlock()
-      : m_pTLMTable(NULL), m_TLMTableSize(0), m_pThreadStaticHandleTable(NULL) 
+      : m_pTLMTable(NULL), m_TLMTableSize(0), m_pThreadStaticHandleTable(NULL), m_lastIndex(-1)
     {
         m_TLMTableLock.Init(LOCK_TYPE_DEFAULT);
     }
@@ -249,6 +253,23 @@ public:
 
     void    EnsureModuleIndex(ModuleIndex index);
 
+    FORCEINLINE BOOL ThreadLocalBlock::TryGetCachedTLM(ModuleIndex index, DWORD domainID, PTR_ThreadLocalModule * ppTLM)
+    {
+        if (m_lastIndex.m_dwIndex == index.m_dwIndex && domainID == m_lastDomainID)
+        {
+            *ppTLM = m_lastTLM;
+            return true;
+        }
+
+        return false;
+    }
+
+    FORCEINLINE void ThreadLocalBlock::SetCachedTLM(PTR_ThreadLocalModule pTLM, ModuleIndex index, DWORD domainID)
+    {
+        m_lastIndex = index;
+        m_lastDomainID = domainID;
+        m_lastTLM = pTLM;
+    }
 #endif
 
     void SetModuleSlot(ModuleIndex index, PTR_ThreadLocalModule pLocalModule);

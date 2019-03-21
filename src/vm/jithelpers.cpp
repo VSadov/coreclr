@@ -1855,13 +1855,23 @@ HCIMPL2(void*, JIT_GetSharedNonGCThreadStaticBase, SIZE_T moduleDomainID, DWORD 
             Module::IDToIndex(moduleDomainID) :
             ((DomainLocalModule *)moduleDomainID)->GetModuleIndex();
 
+    // Get the current ThreadLocalBlock
+    ThreadLocalBlock* pThreadLocalBlock = ThreadStatics::GetCurrentTLB();
+
     // Get the relevant ThreadLocalModule
-    ThreadLocalModule * pThreadLocalModule = ThreadStatics::GetTLMIfExists(index);
+    ThreadLocalModule* pThreadLocalModule;
+    if (pThreadLocalBlock->TryGetCachedTLM(index, dwClassDomainID, &pThreadLocalModule))
+        return (void*)pThreadLocalModule->GetPrecomputedNonGCStaticsBasePointer();
+
+    pThreadLocalModule = pThreadLocalBlock->GetTLMIfExists(index);
 
     // If the TLM has been allocated and the class has been marked as initialized,
     // get the pointer to the non-GC statics base and return
     if (pThreadLocalModule != NULL && pThreadLocalModule->IsPrecomputedClassInitialized(dwClassDomainID))
+    {
+        pThreadLocalBlock->SetCachedTLM(pThreadLocalModule, index, dwClassDomainID);
         return (void*)pThreadLocalModule->GetPrecomputedNonGCStaticsBasePointer();
+    }
 
     // If the TLM was not allocated or if the class was not marked as initialized
     // then we have to go through the slow path
@@ -1899,13 +1909,23 @@ HCIMPL2(void*, JIT_GetSharedGCThreadStaticBase, SIZE_T moduleDomainID, DWORD dwC
             Module::IDToIndex(moduleDomainID) :
             ((DomainLocalModule *)moduleDomainID)->GetModuleIndex();
 
+    // Get the current ThreadLocalBlock
+    ThreadLocalBlock* pThreadLocalBlock = ThreadStatics::GetCurrentTLB();
+
     // Get the relevant ThreadLocalModule
-    ThreadLocalModule * pThreadLocalModule = ThreadStatics::GetTLMIfExists(index);
+    ThreadLocalModule* pThreadLocalModule;
+    if (pThreadLocalBlock->TryGetCachedTLM(index, dwClassDomainID, &pThreadLocalModule))
+        return (void*)pThreadLocalModule->GetPrecomputedGCStaticsBasePointer();
+    
+    pThreadLocalModule = pThreadLocalBlock->GetTLMIfExists(index);
 
     // If the TLM has been allocated and the class has been marked as initialized,
     // get the pointer to the GC statics base and return
     if (pThreadLocalModule != NULL && pThreadLocalModule->IsPrecomputedClassInitialized(dwClassDomainID))
+    {
+        pThreadLocalBlock->SetCachedTLM(pThreadLocalModule, index, dwClassDomainID);
         return (void*)pThreadLocalModule->GetPrecomputedGCStaticsBasePointer();
+    }
 
     // If the TLM was not allocated or if the class was not marked as initialized
     // then we have to go through the slow path
