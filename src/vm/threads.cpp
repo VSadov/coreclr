@@ -39,6 +39,7 @@
 #include "vmholder.h"
 #include "exceptmacros.h"
 #include "win32threadpool.h"
+#include "threadpoolrequest.h"
 
 #ifdef FEATURE_COMINTEROP
 #include "runtimecallablewrapper.h"
@@ -3422,6 +3423,11 @@ DWORD Thread::DoAppropriateWaitWorker(int countHandles, HANDLE *handles, BOOL wa
             return ret;
     }
 
+    if (IsThreadPoolThread())
+    {
+        ThreadpoolMgr::WorkerThreadBlocked();
+    }
+
     // Before going to pre-emptive mode the thread needs to be flagged as waiting for
     // the debugger. This used to be accomplished by the TS_Interruptible flag but that
     // doesn't work reliably, see DevDiv Bugs 699245. Some methods call in here already in
@@ -3594,6 +3600,11 @@ retry:
 WaitCompleted:
 
     _ASSERTE((ret != WAIT_TIMEOUT) || (millis != INFINITE));
+
+    if (IsThreadPoolThread())
+    {
+        ThreadpoolMgr::WorkerThreadUnblocked();
+    }
 
     return ret;
 }
@@ -4156,6 +4167,12 @@ void Thread::UserSleep(INT32 time)
 
     DWORD   res;
 
+
+    if (IsThreadPoolThread())
+    {
+        ThreadpoolMgr::WorkerThreadBlocked();
+    }
+
     // Before going to pre-emptive mode the thread needs to be flagged as waiting for
     // the debugger. This used to be accomplished by the TS_Interruptible flag but that
     // doesn't work reliably, see DevDiv Bugs 699245.
@@ -4216,6 +4233,11 @@ retry:
         }
     }
     _ASSERTE(res == WAIT_TIMEOUT || res == WAIT_OBJECT_0);
+
+    if (IsThreadPoolThread())
+    {
+        ThreadpoolMgr::WorkerThreadUnblocked();
+    }
 }
 
 
