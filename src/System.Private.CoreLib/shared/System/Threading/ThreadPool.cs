@@ -1199,6 +1199,15 @@ namespace System.Threading
             }
         }
 
+        internal void EnsureThreadRequested()
+        {
+            if (numOutstandingThreadRequests == 0 &&
+                Interlocked.CompareExchange(ref numOutstandingThreadRequests, 1, 0) == 0)
+            {
+                ThreadPool.RequestWorkerThread();
+            }
+        }
+
         internal void MarkThreadRequestSatisfied()
         {
             //
@@ -1357,25 +1366,30 @@ namespace System.Threading
                 do
                 {
                     var localQueue = workQueue.GetLocalQueue();
-
-                    bool missedSteal = false;
-                    object workItem = localQueue?.TryPop() ?? workQueue.DequeueAny(ref missedSteal, localQueue);
+                    object workItem = localQueue?.TryPop();
 
                     if (workItem == null)
                     {
-                        if (missedSteal)
+                        for (; ; )
                         {
+                            bool missedSteal = false;
+                            workItem = workQueue.DequeueAny(ref missedSteal, localQueue);
+                            if (workItem != null)
+                            {
+                                break;
+                            }
+
+                            if (!missedSteal)
+                            {
+                                // at this point in time there is no work, return the thread.           
+                                needAnotherThread = false;
+                                // Tell the VM we're returning normally, not because Hill Climbing asked us to return.
+                                return true;
+                            }
                             // We could not get an item, but saw queues with dequeue/enqueue in progress.
                             // so back off a little and try again (as long as quantum has not expired)
                             spinner.SpinOnce();
-                            continue;
                         }
-
-                        // at this point in time there is no work, return the thread.           
-                        needAnotherThread = false;
-
-                        // Tell the VM we're returning normally, not because Hill Climbing asked us to return.
-                        return true;
                     }
 
                     if (workQueue.loggingEnabled)
@@ -1383,8 +1397,8 @@ namespace System.Threading
 
                     //
                     // We are about to execute external code, which can take a while, block or even wait on something from other tasks.
-                    // Make sure there is a request, in case we do not come back for long while.
-                    workQueue.RequestThread();
+                    // Make sure there is a request, in case we do not come back for a while.
+                    workQueue.EnsureThreadRequested();
 
                     //
                     // Execute the workitem outside of any finally blocks, so that it can be aborted if needed.
