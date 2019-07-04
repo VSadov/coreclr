@@ -25,6 +25,14 @@ using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using Internal.Runtime.CompilerServices;
 
+#if BIT64
+using nuint = System.UInt64;
+using nint = System.Int64;
+#else
+using nuint = System.UInt32;
+using nint = System.Int32;
+#endif
+
 //TODO: VS remove
 // [assembly: System.Diagnostics.Debuggable(true, true)]
 
@@ -90,8 +98,8 @@ namespace System.Threading
             [StructLayout(LayoutKind.Explicit, Size = 3 * Internal.PaddingHelpers.CACHE_LINE_SIZE)] // padding before/between/after fields
             internal struct PaddedQueueEnds
             {
-                [FieldOffset(1 * Internal.PaddingHelpers.CACHE_LINE_SIZE)] public int Dequeue;
-                [FieldOffset(2 * Internal.PaddingHelpers.CACHE_LINE_SIZE)] public int Enqueue;
+                [FieldOffset(1 * Internal.PaddingHelpers.CACHE_LINE_SIZE)] public nint Dequeue;
+                [FieldOffset(2 * Internal.PaddingHelpers.CACHE_LINE_SIZE)] public nint Enqueue;
             }
 
             internal class QueueSegmentBase
@@ -103,7 +111,7 @@ namespace System.Threading
                 internal readonly Slot[] _slots;
 
                 /// <summary>Mask for quickly accessing a position within the queue's array.</summary>
-                internal readonly int _slotsMask;
+                internal readonly nint _slotsMask;
 
                 /// <summary>The queue end positions, with padding to help avoid false sharing contention.</summary>
                 internal PaddedQueueEnds _queueEnds; // mutable struct: do not make this readonly
@@ -159,15 +167,15 @@ namespace System.Threading
                     /// <summary>The item.</summary>
                     internal object Item;
                     /// <summary>The sequence number for this slot, used to synchronize between enqueuers and dequeuers.</summary>
-                    internal int SequenceNumber;
+                    internal nint SequenceNumber;
                 }
 
-                internal ref Slot this[int i]
+                internal ref Slot this[nint i]
                 {
                     [MethodImpl(MethodImplOptions.AggressiveInlining)]
                     get
                     {
-                        return ref Unsafe.Add(ref Unsafe.As<byte, Slot>(ref _slots.GetRawSzArrayData()), i & _slotsMask);
+                        return ref Unsafe.Add(ref Unsafe.As<byte, Slot>(ref _slots.GetRawSzArrayData()), new IntPtr(i & _slotsMask));
                     }
                 }
 
@@ -194,11 +202,11 @@ namespace System.Threading
             }
 
             // for debugging
-            internal int Count
+            internal nint Count
             {
                 get
                 {
-                    int count = 0;
+                    nint count = 0;
                     for (var s = _deqSegment; s != null; s = s._nextSegment)
                     {
                         count += s.Count;
@@ -350,7 +358,7 @@ namespace System.Threading
                 internal GlobalQueueSegment(int length) : base(length) { }
 
                 // for debugging
-                internal int Count => _queueEnds.Enqueue - _queueEnds.Dequeue;
+                internal nint Count => _queueEnds.Enqueue - _queueEnds.Dequeue;
 
                 internal bool IsEmpty
                 {
@@ -377,12 +385,12 @@ namespace System.Threading
                     var spinner = new SpinWait();
                     for (; ; )
                     {
-                        int position = _queueEnds.Enqueue;
+                        nint position = _queueEnds.Enqueue;
                         ref Slot slot = ref this[position];
 
                         // Read the sequence number for the enqueue position.
                         // Should read before writing Item, but our write is after CAS, so ordinary read is ok.
-                        int sequenceNumber = slot.SequenceNumber;
+                        nint sequenceNumber = slot.SequenceNumber;
 
                         // The slot is empty and ready for us to enqueue into it if its sequence number matches the slot.
                         if (sequenceNumber == position)
@@ -429,12 +437,12 @@ namespace System.Threading
 
                     for (; ; )
                     {
-                        int position = _queueEnds.Dequeue;
+                        nint position = _queueEnds.Dequeue;
                         ref Slot slot = ref this[position];
 
                         // Read the sequence number for the slot.
                         // Should read before reading Item, but we read Item after CAS, so ordinary read is ok.
-                        int sequenceNumber = slot.SequenceNumber;
+                        nint sequenceNumber = slot.SequenceNumber;
 
                         // Check if the slot is considered Full in the current generation.
                         if (sequenceNumber == position + Full)
@@ -519,11 +527,11 @@ namespace System.Threading
             }
 
             // for debugging
-            internal int Count
+            internal nint Count
             {
                 get
                 {
-                    int count = 0;
+                    nint count = 0;
                     for (var s = _deqSegment; s != null; s = s._nextSegment)
                     {
                         count += s.Count;
@@ -732,11 +740,11 @@ namespace System.Threading
                 internal bool TryEnqueue(object item)
                 {
                     // Loop in case of contention...
-                    int position = _queueEnds.Enqueue;
+                    nint position = _queueEnds.Enqueue;
                     for (; ; )
                     {
                         ref Slot prevSlot = ref this[position - 1];
-                        int prevSequenceNumber = prevSlot.SequenceNumber;
+                        nint prevSequenceNumber = prevSlot.SequenceNumber;
                         ref Slot slot = ref this[position];
 
                         // check if prev slot is empty in the next generation or full
@@ -752,7 +760,7 @@ namespace System.Threading
                                 {
                                     // Successfully locked prev slot.
                                     // is the slot empty?   (most common path)                                
-                                    int sequenceNumber = slot.SequenceNumber;
+                                    nint sequenceNumber = slot.SequenceNumber;
                                     if (sequenceNumber == position)
                                     {
                                         // update Enqueue - must be before marking the slot full. 
@@ -808,17 +816,17 @@ namespace System.Threading
                 }
 
                 // for debugging
-                internal int Count => _queueEnds.Enqueue - _queueEnds.Dequeue;
+                internal nint Count => _queueEnds.Enqueue - _queueEnds.Dequeue;
 
                 internal object TryPop()
                 {
                     for (; ; )
                     {
-                        int position = _queueEnds.Enqueue - 1;
+                        nint position = _queueEnds.Enqueue - 1;
                         ref Slot slot = ref this[position];
 
                         // Read the sequence number for the cell.
-                        int sequenceNumber = slot.SequenceNumber;
+                        nint sequenceNumber = slot.SequenceNumber;
 
                         // Check if the slot is considered Full in the current generation (other likely state - Empty).
                         if (sequenceNumber == position + Full)
@@ -877,7 +885,7 @@ namespace System.Threading
                 {
                     for (; ; )
                     {
-                        int position = _queueEnds.Dequeue;
+                        nint position = _queueEnds.Dequeue;
 
                         // if prev is not empty (in next generation), there might be more work in the segment.
                         // NB: enqueues are initiated by locking the prev slot.
@@ -893,7 +901,7 @@ namespace System.Threading
 
                         // Read the sequence number for the cell.
                         ref Slot slot = ref this[position];
-                        int sequenceNumber = slot.SequenceNumber;
+                        nint sequenceNumber = slot.SequenceNumber;
 
                         // Check if the slot is considered Full in the current generation.
                         if (sequenceNumber == position + Full)
@@ -947,8 +955,8 @@ namespace System.Threading
                     [MethodImpl(MethodImplOptions.AggressiveInlining)]
                     get
                     {
-                        int position = _queueEnds.Dequeue;
-                        int sequenceNumber = this[position].SequenceNumber;
+                        nint position = _queueEnds.Dequeue;
+                        nint sequenceNumber = this[position].SequenceNumber;
 
                         // "position == sequenceNumber" means that we have reached an empty slot.
                         // since full slots are contiguous, finding an empty slot means that 
@@ -957,20 +965,20 @@ namespace System.Threading
                     }
                 }
 
-                object TryRob(int deqPosition, int enqPosition)
+                object TryRob(nint deqPosition, nint enqPosition)
                 {
                     LocalQueueSegment other = ThreadPoolGlobals.workQueue.GetOrAddLocalQueue()._enqSegment;
                     if (this != other)
                     {
                         // same stanza as in TryEnqueue
-                        int otherEnqPosition = other._queueEnds.Enqueue;
+                        nint otherEnqPosition = other._queueEnds.Enqueue;
                         ref Slot enqPrevSlot = ref other[otherEnqPosition - 1];
-                        int prevSequenceNumber = enqPrevSlot.SequenceNumber;
+                        nint prevSequenceNumber = enqPrevSlot.SequenceNumber;
 
                         var srcSlotsMask = _slotsMask;
                         // mask in case it is frozen and enqueue is inflated
                         var count = (enqPosition - deqPosition) & srcSlotsMask;
-                        int halfPosition = deqPosition + count / 2;
+                        nint halfPosition = deqPosition + count / 2;
                         ref Slot halfSlot = ref this[halfPosition];
 
                         // unlike Enqueue, we require prev slot be empty
@@ -994,7 +1002,7 @@ namespace System.Threading
                                         var enq = deqPosition + ((_queueEnds.Enqueue - deqPosition) & _slotsMask);
                                         if (enq - halfPosition > (RichCount / 4))
                                         {
-                                            int i = deqPosition, j = otherEnqPosition;
+                                            nint i = deqPosition, j = otherEnqPosition;
                                             ref Slot last = ref this[i++];
 
                                             while (true)
@@ -1068,7 +1076,7 @@ namespace System.Threading
                 /// </summary>
                 internal bool TryRemove(object callback)
                 {
-                    for (int position = _queueEnds.Enqueue - 1, l = position - RemoveRange; position != l; position--)
+                    for (nint position = _queueEnds.Enqueue - 1, l = position - RemoveRange; position != l; position--)
                     {
                         ref Slot slot = ref this[position];
                         if (slot.Item == callback)
