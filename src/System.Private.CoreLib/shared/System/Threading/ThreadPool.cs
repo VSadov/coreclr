@@ -1362,7 +1362,6 @@ namespace System.Threading
                 //
                 // Loop until our quantum expires or there is no work.
                 //
-                var spinner = new SpinWait();
                 do
                 {
                     var localQueue = workQueue.GetLocalQueue();
@@ -1370,6 +1369,7 @@ namespace System.Threading
 
                     if (workItem == null)
                     {
+                        var spinner = new SpinWait();
                         for (; ; )
                         {
                             bool missedSteal = false;
