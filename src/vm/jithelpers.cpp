@@ -2103,18 +2103,7 @@ TypeHandle::CastResult ArrayIsInstanceOfNoGC(MethodTable* pMT, TypeHandle toType
     }
     _ASSERTE(pMT->GetRank() == toArrayType->GetRank());
 
-    // ArrayBase::GetTypeHandle consults the loader tables to find the
-    // exact type handle for an array object.  This can be disproportionately slow - but after
-    // all, why should we need to go looking up hash tables just to do a cast test?
-    //
-    // Thus we can always special-case the casting logic to avoid fetching this
-    // exact type handle.  Here we have only done so for one
-    // particular case, i.e. when we are trying to cast to an array type where
-    // there is an exact match between the rank, kind and element type of the two
-    // array types.  This happens when, for example, assigning an int32[] into an int32[][].
-    //
-
-    //TODO: "Approx" API may need renaming. Arrays know their ElementType quite precisely.
+    //TODO: VS "Approx" API may need renaming. Arrays know their ElementType quite precisely.
     TypeHandle elementTypeHandle = pMT->GetApproxArrayElementTypeHandle();
     TypeHandle toElementTypeHandle = toArrayType->GetArrayElementTypeHandle();
 
@@ -2124,11 +2113,7 @@ TypeHandle::CastResult ArrayIsInstanceOfNoGC(MethodTable* pMT, TypeHandle toType
         return TypeHandle::CanCast;
     }
 
-    // By this point we know that toArrayType->GetInternalCorElementType matches the element type of the Array object
-    // so we can use a faster constructor to create the TypeDesc. (It so happens that ArrayTypeDescs derives from ParamTypeDesc
-    // and can be created as identical in a slightly faster way with the following set of parameters.)
-    ParamTypeDesc arrayType(toArrayType->GetInternalCorElementType(), pMT, elementTypeHandle);
-    TypeHandle::CastResult result = arrayType.CanCastToNoGC(toTypeHnd);
+    TypeHandle::CastResult result = TypeDesc::CanCastParamNoGC(elementTypeHandle, toElementTypeHandle);
     if (result != TypeHandle::MaybeCast)
     {
         CastCache::TryAddToCacheNoGC(pMT, toTypeHnd, (BOOL)result);
@@ -2196,7 +2181,7 @@ TypeHandle::CastResult STDCALL ObjIsInstanceOfNoGC(Object *pObject, TypeHandle t
     return ObjIsInstanceOfNoGCCore(pObject, toTypeHnd);
 }
 
-BOOL ObjIsInstanceOf(Object *pObject, TypeHandle toTypeHnd, BOOL throwCastException)
+BOOL ObjIsInstanceOfCore(Object *pObject, TypeHandle toTypeHnd, BOOL throwCastException)
 {
     CONTRACTL {
         THROWS;
@@ -2206,9 +2191,6 @@ BOOL ObjIsInstanceOf(Object *pObject, TypeHandle toTypeHnd, BOOL throwCastExcept
     } CONTRACTL_END;
 
     BOOL fCast = FALSE;
-
-    // when castability is decided by calling to actual objects, do not cache
-    BOOL canCache = TRUE;
 
     OBJECTREF obj = ObjectToOBJECTREF(pObject);
 
@@ -2230,7 +2212,6 @@ BOOL ObjIsInstanceOf(Object *pObject, TypeHandle toTypeHnd, BOOL throwCastExcept
     // if it implements the interface.
     if (toTypeHnd.IsInterface() && fromTypeHnd.GetMethodTable()->IsComObjectType())
     {
-        canCache = FALSE;
         fCast = ComObject::SupportsInterface(obj, toTypeHnd.AsMethodTable());
     }
     else
@@ -2238,6 +2219,7 @@ BOOL ObjIsInstanceOf(Object *pObject, TypeHandle toTypeHnd, BOOL throwCastExcept
     if (Nullable::IsNullableForType(toTypeHnd, obj->GetMethodTable()))
     {
         // allow an object of type T to be cast to Nullable<T> (they have the same representation)
+        CastCache::TryAddToCache(fromTypeHnd, toTypeHnd, TRUE);
         fCast = TRUE;
     }
 #ifdef FEATURE_ICASTABLE
@@ -2245,7 +2227,6 @@ BOOL ObjIsInstanceOf(Object *pObject, TypeHandle toTypeHnd, BOOL throwCastExcept
     // to a given type.
     else if (toTypeHnd.IsInterface() && fromTypeHnd.GetMethodTable()->IsICastable())
     {
-        canCache = FALSE;
         // Make actuall call to ICastableHelpers.IsInstanceOfInterface(obj, interfaceTypeObj, out exception)
         OBJECTREF exception = NULL;
         GCPROTECT_BEGIN(exception);
@@ -2270,11 +2251,6 @@ BOOL ObjIsInstanceOf(Object *pObject, TypeHandle toTypeHnd, BOOL throwCastExcept
     }
 #endif // FEATURE_ICASTABLE   
 
-    if (canCache)
-    {
-        CastCache::TryAddToCache(fromTypeHnd, toTypeHnd, fCast);
-    }
-
     if (!fCast && throwCastException)
     {
         COMPlusThrowInvalidCastException(&obj, toTypeHnd);
@@ -2283,6 +2259,27 @@ BOOL ObjIsInstanceOf(Object *pObject, TypeHandle toTypeHnd, BOOL throwCastExcept
     GCPROTECT_END(); // obj
 
     return(fCast);
+}
+
+BOOL ObjIsInstanceOf(Object* pObject, TypeHandle toTypeHnd, BOOL throwCastException)
+{
+    CONTRACTL{
+        THROWS;
+        GC_TRIGGERS;
+        MODE_COOPERATIVE;
+        PRECONDITION(CheckPointer(pObject));
+    } CONTRACTL_END;
+
+    MethodTable* pMT = pObject->GetMethodTable();
+    TypeHandle::CastResult result = CastCache::TryGetFromCache(pMT, toTypeHnd);
+
+    if (result == TypeHandle::CanCast ||
+        (result == TypeHandle::CannotCast && !throwCastException))
+    {
+        return (BOOL)result;
+    }
+
+    return ObjIsInstanceOfCore(pObject, toTypeHnd, throwCastException);
 }
 
 //
@@ -2464,7 +2461,7 @@ HCIMPL2(Object *, JIT_ChkCastArray, CORINFO_CLASS_HANDLE type, Object *pObject)
     }
 
     ENDFORBIDGC();
-    Object* pRet = HCCALL2(JITutil_ChkCastAny, type, pObject);
+    Object* pRet = HCCALL2(JITutil_ChkCastAny_NoCacheLookup, type, pObject);
     // Make sure that the fast helper have not lied
     _ASSERTE(result != TypeHandle::CannotCast);
     return pRet;
@@ -2514,7 +2511,7 @@ HCIMPL2(Object *, JIT_IsInstanceOfArray, CORINFO_CLASS_HANDLE type, Object *pObj
     }
 
     ENDFORBIDGC();
-    return HCCALL2(JITutil_IsInstanceOfAny, type, pObject);
+    return HCCALL2(JITutil_IsInstanceOfAny_NoCacheLookup, type, pObject);
 }
 HCIMPLEND
 
@@ -2543,7 +2540,7 @@ HCIMPL2(Object *, JIT_IsInstanceOfAny, CORINFO_CLASS_HANDLE type, Object* obj)
     }
 
     ENDFORBIDGC();
-    return HCCALL2(JITutil_IsInstanceOfAny, type, obj);
+    return HCCALL2(JITutil_IsInstanceOfAny_NoCacheLookup, type, obj);
 }
 HCIMPLEND
 
@@ -2567,7 +2564,7 @@ HCIMPL2(Object *, JIT_ChkCastAny, CORINFO_CLASS_HANDLE type, Object *pObject)
     }
 
     ENDFORBIDGC();
-    Object* pRet = HCCALL2(JITutil_ChkCastAny, type, pObject);
+    Object* pRet = HCCALL2(JITutil_ChkCastAny_NoCacheLookup, type, pObject);
     // Make sure that the fast helper have not lied
     _ASSERTE(result != TypeHandle::CannotCast);
     return pRet;
@@ -2580,22 +2577,25 @@ NOINLINE HCIMPL2(Object *, JITutil_IsInstanceOfInterface, MethodTable *pInterfac
     FCALL_CONTRACT;
 
     MethodTable* pMT = obj->GetMethodTable();
-    if (pMT->IsArray() && pInterfaceMT->HasInstantiation())
+
+    TypeHandle::CastResult result = CastCache::TryGetFromCache(pMT, pInterfaceMT);
+    if (result == TypeHandle::MaybeCast && pMT->IsArray() && pInterfaceMT->HasInstantiation())
     {
-        switch (pMT->ArraySupportsBizarreInterfaceNoGC(pInterfaceMT)) {
-        case TypeHandle::CanCast:
-            return obj;
-        case TypeHandle::CannotCast:
-            return NULL;
-        default:
-            // fall through to the slow helper
-            break;
-        }
+        result = pMT->ArraySupportsBizarreInterfaceNoGC(pInterfaceMT);
+    }
+
+    switch (result) {
+    case TypeHandle::CanCast:
+        return obj;
+    case TypeHandle::CannotCast:
+        return NULL;
+    default:
+        // fall through to the slow helper
+        break;
     }
 
     ENDFORBIDGC();
-    return HCCALL2(JITutil_IsInstanceOfAny, CORINFO_CLASS_HANDLE(pInterfaceMT), obj);
-
+    return HCCALL2(JITutil_IsInstanceOfAny_NoCacheLookup, CORINFO_CLASS_HANDLE(pInterfaceMT), obj);
 }
 HCIMPLEND
 
@@ -2604,16 +2604,20 @@ NOINLINE HCIMPL2(Object *, JITutil_ChkCastInterface, MethodTable *pInterfaceMT, 
     FCALL_CONTRACT;
 
     MethodTable* pMT = obj->GetMethodTable();
-    if (pMT->IsArray() && pInterfaceMT->HasInstantiation())
+
+    TypeHandle::CastResult result = CastCache::TryGetFromCache(pMT, pInterfaceMT);
+    if (result == TypeHandle::MaybeCast && pMT->IsArray() && pInterfaceMT->HasInstantiation())
     {
-        if (pMT->ArraySupportsBizarreInterfaceNoGC(pInterfaceMT) == TypeHandle::CanCast)
-        {
-            return obj;
-        }
+        result = pMT->ArraySupportsBizarreInterfaceNoGC(pInterfaceMT);
+    }
+
+    if (result == TypeHandle::CanCast)
+    {
+        return obj;
     }
 
     ENDFORBIDGC();
-    return HCCALL2(JITutil_ChkCastAny, CORINFO_CLASS_HANDLE(pInterfaceMT), obj);
+    return HCCALL2(JITutil_ChkCastAny_NoCacheLookup, CORINFO_CLASS_HANDLE(pInterfaceMT), obj);
 }
 HCIMPLEND
 
@@ -2668,7 +2672,49 @@ NOINLINE HCIMPL2(Object *, JITutil_IsInstanceOfAny, CORINFO_CLASS_HANDLE type, O
 }
 HCIMPLEND
 
+NOINLINE HCIMPL2(Object*, JITutil_ChkCastAny_NoCacheLookup, CORINFO_CLASS_HANDLE type, Object* obj)
+{
+    FCALL_CONTRACT;
 
+    // This case should be handled by frameless helper
+    _ASSERTE(obj != NULL);
+
+    OBJECTREF oref = ObjectToOBJECTREF(obj);
+    VALIDATEOBJECTREF(oref);
+
+    TypeHandle clsHnd(type);
+
+    HELPER_METHOD_FRAME_BEGIN_RET_1(oref);
+    if (!ObjIsInstanceOfCore(OBJECTREFToObject(oref), clsHnd, TRUE))
+    {
+        UNREACHABLE(); //ObjIsInstanceOf will throw if cast can't be done
+    }
+    HELPER_METHOD_FRAME_END();
+
+    return OBJECTREFToObject(oref);
+}
+HCIMPLEND
+
+NOINLINE HCIMPL2(Object*, JITutil_IsInstanceOfAny_NoCacheLookup, CORINFO_CLASS_HANDLE type, Object* obj)
+{
+    FCALL_CONTRACT;
+
+    // This case should be handled by frameless helper
+    _ASSERTE(obj != NULL);
+
+    OBJECTREF oref = ObjectToOBJECTREF(obj);
+    VALIDATEOBJECTREF(oref);
+
+    TypeHandle clsHnd(type);
+
+    HELPER_METHOD_FRAME_BEGIN_RET_1(oref);
+    if (!ObjIsInstanceOfCore(OBJECTREFToObject(oref), clsHnd))
+        oref = NULL;
+    HELPER_METHOD_FRAME_END();
+
+    return OBJECTREFToObject(oref);
+}
+HCIMPLEND
 
 //========================================================================
 //
@@ -3300,7 +3346,8 @@ HCIMPL2(LPVOID, ArrayStoreCheck, Object** pElement, PtrArray** pArray)
 
     GCStress<cfg_any, EeconfigFastGcSPolicy>::MaybeTrigger();
 
-    if (!ObjIsInstanceOf(*pElement, (*pArray)->GetArrayElementTypeHandle()))
+    // call "Core" version directly since all the callers do the "NoGC" call first and that checks the cache 
+    if (!ObjIsInstanceOfCore(*pElement, (*pArray)->GetArrayElementTypeHandle()))
         COMPlusThrow(kArrayTypeMismatchException);
 
     HELPER_METHOD_FRAME_END();

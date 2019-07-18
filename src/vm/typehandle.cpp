@@ -22,6 +22,8 @@
 #include "typestring.h"
 #include "classloadlevel.h"
 #include "array.h"
+#include "castcache.h"
+
 #ifdef FEATURE_PREJIT 
 #include "zapsig.h"
 #endif
@@ -708,17 +710,22 @@ BOOL TypeHandle::CanCastTo(TypeHandle type, TypeHandlePairList *pVisited)  const
     }
     CONTRACTL_END
 
-    //TODO: VS check cache? 
-
     if (*this == type)
-        return(true);
+        return true;
 
-    if (IsTypeDesc())
+    bool isTypeDesc = IsTypeDesc();
+    if (!isTypeDesc && type.IsTypeDesc())
+        return false;
+
+    TypeHandle::CastResult result = CastCache::TryGetFromCacheAny(*this, type);
+    if (result != TypeHandle::MaybeCast)
+    {
+        return (BOOL)result;
+    }
+
+    if (isTypeDesc)
         return AsTypeDesc()->CanCastTo(type, pVisited);
                 
-    if (type.IsTypeDesc())
-        return(false);
-
     return AsMethodTable()->CanCastToClassOrInterface(type.AsMethodTable(), pVisited);
 }
 
@@ -727,17 +734,22 @@ TypeHandle::CastResult TypeHandle::CanCastToNoGC(TypeHandle type)  const
 {
     LIMITED_METHOD_CONTRACT;
 
-    //TODO: VS check cache? 
-
     if (*this == type)
-        return(CanCast);
+        return CanCast;
 
-    if (IsTypeDesc())
+    bool isTypeDesc = IsTypeDesc();
+    if (!isTypeDesc && type.IsTypeDesc())
+        return CannotCast;
+
+    TypeHandle::CastResult result = CastCache::TryGetFromCacheAny(*this, type);
+    if (result != TypeHandle::MaybeCast)
+    {
+        return result;
+    }
+
+    if (isTypeDesc)
         return AsTypeDesc()->CanCastToNoGC(type);
                 
-    if (type.IsTypeDesc())
-        return(CannotCast);
-
     return AsMethodTable()->CanCastToClassOrInterfaceNoGC(type.AsMethodTable());
 }
 #include <optdefault.h>
