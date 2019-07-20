@@ -2072,8 +2072,6 @@ HCIMPLEND_RAW
 //
 //========================================================================
 
-
-
 TypeHandle::CastResult ObjIsInstanceOfNoGCCore(Object *pObject, TypeHandle toTypeHnd)
 {
     CONTRACTL {
@@ -2082,8 +2080,7 @@ TypeHandle::CastResult ObjIsInstanceOfNoGCCore(Object *pObject, TypeHandle toTyp
         MODE_COOPERATIVE;
         PRECONDITION(CheckPointer(pObject));
     } CONTRACTL_END;
-
-
+    
     MethodTable *pMT = pObject->GetMethodTable();
 
     // Quick exact match should be checked already (a cache lookup would do it)
@@ -2142,11 +2139,6 @@ BOOL ObjIsInstanceOfCore(Object *pObject, TypeHandle toTypeHnd, BOOL throwCastEx
         MODE_COOPERATIVE;
         PRECONDITION(CheckPointer(pObject));
     } CONTRACTL_END;
-
-    // If we are trying to cast a proxy we need to delegate to remoting
-    // services which will determine whether the proxy and the type are compatible.
-    // Start by doing a quick static cast check to see if the type information captured in
-    // the metadata indicates that the cast is legal.
 
     BOOL fCast = FALSE;
     MethodTable* pMT = pObject->GetMethodTable();

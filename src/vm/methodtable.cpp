@@ -62,6 +62,7 @@
 #include "typestring.h"
 #include "typedesc.h"
 #include "array.h"
+#include "castcache.h"
 
 #ifdef FEATURE_INTERPRETER
 #include "interpreter.h"
@@ -1749,6 +1750,61 @@ TypeHandle::CastResult MethodTable::CanCastToClassNoGC(MethodTable *pTargetMT)
 }
 
 //==========================================================================================
+TypeHandle::CastResult MethodTable::CanCastToClassOrInterfaceNoGC(MethodTable* pTargetMT)
+{
+    CONTRACTL
+    {
+        NOTHROW;
+        GC_NOTRIGGER;
+        MODE_COOPERATIVE;
+        INSTANCE_CHECK;
+        PRECONDITION(CheckPointer(pTargetMT));
+        PRECONDITION(!pTargetMT->IsArray());
+    }
+        CONTRACTL_END
+
+        TypeHandle::CastResult result = pTargetMT->IsInterface() ?
+                                            CanCastToInterfaceNoGC(pTargetMT) :
+                                            CanCastToClassNoGC(pTargetMT);
+
+    if (result != TypeHandle::MaybeCast)
+    {
+        CastCache::TryAddToCacheNoGC(this, pTargetMT, (BOOL)result);
+    }
+
+    return result;
+}
+
+//==========================================================================================
+BOOL MethodTable::CanCastToClassOrInterface(MethodTable* pTargetMT, TypeHandlePairList* pVisited)
+{
+    CONTRACTL
+    {
+        THROWS;
+        GC_TRIGGERS;
+        MODE_COOPERATIVE;
+        INSTANCE_CHECK;
+        PRECONDITION(CheckPointer(pTargetMT));
+        PRECONDITION(!pTargetMT->IsArray());
+        PRECONDITION(IsRestored_NoLogging());
+    }
+        CONTRACTL_END
+
+        BOOL result = pTargetMT->IsInterface() ?
+                                    CanCastToInterface(pTargetMT, pVisited) :
+                                    CanCastToClass(pTargetMT, pVisited);
+
+    // We only consider type-based conversion rules here.
+    // Therefore a negative result cannot rule out convertibility for ICastable and COM objects
+    if (result || !(pTargetMT->IsInterface() && (this->IsComObjectType() || this->IsICastable())))
+    {
+        CastCache::TryAddToCache(this, pTargetMT, (BOOL)result);
+    }
+
+    return result;
+}
+
+//==========================================================================================
 BOOL MethodTable::ArraySupportsBizarreInterface(MethodTable * pInterfaceMT, TypeHandlePairList* pVisited)
 {
     CONTRACTL {
@@ -1773,7 +1829,6 @@ BOOL MethodTable::ArraySupportsBizarreInterface(MethodTable * pInterfaceMT, Type
         return FALSE;
     }
 
-    //TODO: "Approx" API may need renaming. Arrays know their ElementType quite precisely.
     BOOL result = TypeDesc::CanCastParam(this->GetApproxArrayElementTypeHandle(), pInterfaceMT->GetInstantiation()[0], pVisited);
 
     CastCache::TryAddToCache(this, pInterfaceMT, (BOOL)result);
@@ -1811,7 +1866,6 @@ TypeHandle::CastResult MethodTable::ArraySupportsBizarreInterfaceNoGC(MethodTabl
         return TypeHandle::CannotCast;
     }
 
-    //TODO: "Approx" API may need renaming. Arrays know their ElementType quite precisely.
     TypeHandle::CastResult result = TypeDesc::CanCastParamNoGC(this->GetApproxArrayElementTypeHandle(), pInterfaceMT->GetInstantiation()[0]);
     if (result != TypeHandle::MaybeCast)
     {
@@ -1853,7 +1907,6 @@ TypeHandle::CastResult MethodTable::ArrayIsInstanceOfNoGC(TypeHandle toTypeHnd)
     }
     _ASSERTE(this->GetRank() == toArrayType->GetRank());
 
-    //TODO: VS "Approx" API may need renaming. Arrays know their ElementType quite precisely.
     TypeHandle elementTypeHandle = this->GetApproxArrayElementTypeHandle();
     TypeHandle toElementTypeHandle = toArrayType->GetArrayElementTypeHandle();
 
@@ -1903,7 +1956,6 @@ BOOL MethodTable::ArrayIsInstanceOf(TypeHandle toTypeHnd, TypeHandlePairList* pV
     }
     _ASSERTE(this->GetRank() == toArrayType->GetRank());
 
-    //TODO: VS "Approx" API may need renaming. Arrays know their ElementType quite precisely.
     TypeHandle elementTypeHandle = this->GetApproxArrayElementTypeHandle();
     TypeHandle toElementTypeHandle = toArrayType->GetArrayElementTypeHandle();
 
@@ -1915,7 +1967,6 @@ BOOL MethodTable::ArrayIsInstanceOf(TypeHandle toTypeHnd, TypeHandlePairList* pV
 }
 
 #include <optdefault.h>
-
 
 BOOL 
 MethodTable::IsExternallyVisible()
