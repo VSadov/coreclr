@@ -49,6 +49,7 @@
 #include <psapi.h>
 #endif
 
+#include "castcache.h"
 
 #ifndef DACCESS_COMPILE
 
@@ -4947,9 +4948,9 @@ VOID StubLinkerCPU::EmitArrayOpStub(const ArrayOpScript* pArrayOpScript)
             X86EmitOp(0x3b, kEAX, kArrayMTReg, MethodTable::GetOffsetOfArrayElementTypeHandle() AMD64_ARG(k64BitOp));
             X86EmitCondJump(CheckPassed, X86CondCode::kJZ);             // Assigning to array of object is OK
 
-            // Try to call the fast helper first ( ObjIsInstanceOfNoGC ).
+            // Try to the cast cache first ( TryGetFromCache ).
             // If that fails we will fall back to calling the slow helper ( ArrayStoreCheck ) that erects a frame.
-            // See also JitInterfaceX86::JIT_Stelem_Ref  
+            // See also JIT_Stelem_Ref  
                                    
 #ifdef _TARGET_AMD64_
             // RCX contains pointer to object to check (Object*)
@@ -4987,8 +4988,8 @@ VOID StubLinkerCPU::EmitArrayOpStub(const ArrayOpScript* pArrayOpScript)
             // it in the fast path anyway. the reason for that is that it makes
             // the cleanup code much easier ( we have only 1 place to cleanup the stack and
             // restore it to the original state )
-            X86EmitCall(NewExternalCodeLabel((LPVOID)ObjIsInstanceOfNoGC), 0);
-            X86EmitCmpRegImm32( kEAX, TypeHandle::CanCast); // CMP EAX, CanCast ; if ObjIsInstanceOfNoGC returns CanCast, we will go the fast path
+            X86EmitCall(NewExternalCodeLabel((LPVOID)(TypeHandle::CastResult(*)(MethodTable*, TypeHandle))CastCache::TryGetFromCache), 0);
+            X86EmitCmpRegImm32( kEAX, TypeHandle::CanCast); // CMP EAX, CanCast ; if TryGetFromCache returns CanCast, we will go the fast path
             CodeLabel * Cleanup = NewCodeLabel();
             X86EmitCondJump(Cleanup, X86CondCode::kJZ);
                                                
