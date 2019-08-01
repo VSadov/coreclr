@@ -545,6 +545,4 @@ inline BOOL ClrFlushInstructionCache(LPCVOID pCodeAddr, size_t sizeOfCode)
 #define JIT_IsInstanceOfInterface   JIT_IsInstanceOfInterface
 #endif // FEATURE_PAL
 
-#define JIT_Stelem_Ref              JIT_Stelem_Ref
-
 #endif // __cgencpu_h__

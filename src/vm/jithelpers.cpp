@@ -3343,7 +3343,8 @@ HCIMPL3(void, JIT_Stelem_Ref_Portable, PtrArray* array, unsigned idx, Object *va
 
         if (arrayElemTH != TypeHandle(valMT) && arrayElemTH != TypeHandle(g_pObjectClass))
         {   
-            TypeHandle::CastResult result = ObjIsInstanceOfNoGC(val, arrayElemTH);
+            TypeHandle::CastResult result = CastCache::TryGetFromCache(valMT, arrayElemTH);
+
             if (result != TypeHandle::CanCast)
             {
                 // FCALL_CONTRACT increase ForbidGC count.  Normally, HELPER_METHOD_FRAME macros decrease the count.
@@ -3358,17 +3359,12 @@ HCIMPL3(void, JIT_Stelem_Ref_Portable, PtrArray* array, unsigned idx, Object *va
             }
         }
 
-#ifdef _TARGET_ARM64_
-        SetObjectReference((OBJECTREF*)&array->m_Array[idx], ObjectToOBJECTREF(val));
-#else
         // The performance gain of the optimized JIT_Stelem_Ref in
         // jitinterfacex86.cpp is mainly due to calling JIT_WriteBarrier
         // By calling write barrier directly here,
         // we can avoid translating in-line assembly from MSVC to gcc
         // while keeping most of the performance gain.
         HCCALL2(JIT_WriteBarrier, (Object **)&array->m_Array[idx], val);
-#endif
-
     }
     else
     {
