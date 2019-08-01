@@ -3323,7 +3323,7 @@ HCIMPLEND
 /****************************************************************************/
 /* assigns 'val to 'array[idx], after doing all the proper checks */
 
-HCIMPL3(void, JIT_Stelem_Ref_Portable, PtrArray* array, unsigned idx, Object *val)
+HCIMPL3(void, JIT_Stelem_Ref, PtrArray* array, unsigned idx, Object *val)
 {
     FCALL_CONTRACT;
 
@@ -3359,11 +3359,8 @@ HCIMPL3(void, JIT_Stelem_Ref_Portable, PtrArray* array, unsigned idx, Object *va
             }
         }
 
-        // The performance gain of the optimized JIT_Stelem_Ref in
-        // jitinterfacex86.cpp is mainly due to calling JIT_WriteBarrier
-        // By calling write barrier directly here,
-        // we can avoid translating in-line assembly from MSVC to gcc
-        // while keeping most of the performance gain.
+        // The performance gain of the optimized JIT_Stelem_Ref is mainly due to 
+        // calling JIT_WriteBarrier directly here
         HCCALL2(JIT_WriteBarrier, (Object **)&array->m_Array[idx], val);
     }
     else
