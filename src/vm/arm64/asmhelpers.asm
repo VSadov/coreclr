@@ -36,7 +36,6 @@
     IMPORT DynamicHelperWorker
 #endif
 
-    IMPORT ObjIsInstanceOfNoGC
     IMPORT ArrayStoreCheck
     SETALIAS g_pObjectClass,  ?g_pObjectClass@@3PEAVMethodTable@@EA 
     IMPORT  $g_pObjectClass

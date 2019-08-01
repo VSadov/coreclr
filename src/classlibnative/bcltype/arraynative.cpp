@@ -17,6 +17,7 @@
 #include "invokeutil.h"
 
 #include "arraynative.inl"
+#include "castcache.h"
 
 FCIMPL1(INT32, ArrayNative::GetRank, ArrayBase* array)
 {
@@ -1320,16 +1321,14 @@ FCIMPL2(void, ArrayNative::SetValue, TypedByRef * target, Object* objUNSAFE)
         else
             ClearObjectReference((OBJECTREF*)target->data);
     }
-    else
-    if (thTarget == TypeHandle(g_pObjectClass))
+    else if (thTarget == TypeHandle(g_pObjectClass))
     {
         // Everything is compatible with Object
         SetObjectReference((OBJECTREF*)target->data,(OBJECTREF)obj);
     }
-    else
-    if (!pTargetMT->IsValueType())
+    else if (!pTargetMT->IsValueType())
     {
-        if (ObjIsInstanceOfNoGC(OBJECTREFToObject(obj), thTarget) != TypeHandle::CanCast)
+        if (CastCache::TryGetFromCache(OBJECTREFToObject(obj)->GetMethodTable(), thTarget) != TypeHandle::CanCast)
         {
             // target->data is protected by the caller
             HELPER_METHOD_FRAME_BEGIN_1(obj);

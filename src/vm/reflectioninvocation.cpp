@@ -27,6 +27,7 @@
 
 #include "dbginterface.h"
 #include "argdestination.h"
+#include "castcache.h"
 
 /**************************************************************************/
 /* if the type handle 'th' is a byref to a nullable type, return the
@@ -606,7 +607,7 @@ FCIMPL2(FC_BOOL_RET, RuntimeTypeHandle::IsInstanceOfType, ReflectClassBaseObject
     if (refType == NULL)
         FCThrowRes(kArgumentNullException, W("Arg_InvalidHandle"));    
 
-    switch (ObjIsInstanceOfNoGC(objectUNSAFE, refType->GetType())) {
+    switch (CastCache::TryGetFromCache(objectUNSAFE->GetMethodTable(), refType->GetType())) {
     case TypeHandle::CanCast:
         FC_RETURN_BOOL(true);
     case TypeHandle::CannotCast:

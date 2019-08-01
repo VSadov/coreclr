@@ -729,7 +729,6 @@ g_pObjectClass      equ     ?g_pObjectClass@@3PEAVMethodTable@@EA
 
 EXTERN  g_pObjectClass:qword
 extern ArrayStoreCheck:proc
-extern ObjIsInstanceOfNoGC:proc
 extern JIT_FailFast:proc
 extern s_gsCookie:qword
 

@@ -24,7 +24,6 @@
     IMPORT PreStubWorker
     IMPORT PreStubGetMethodDescForCompactEntryPoint
     IMPORT NDirectImportWorker
-    IMPORT ObjIsInstanceOfNoGC
     IMPORT ArrayStoreCheck
     IMPORT VSD_ResolveWorker
     IMPORT $g_pObjectClass

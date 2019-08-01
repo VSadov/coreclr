@@ -20,6 +20,7 @@
 #include "comdatetime.h"
 #include "gcheaputilities.h"
 #include "interoputil.h"
+#include "castcache.h"
 
 #ifdef FEATURE_COMINTEROP
 #include <oletls.h>
@@ -1737,7 +1738,7 @@ FCIMPL2(void, StubHelpers::ArrayTypeCheck, Object* element, PtrArray* arr)
 {
     FCALL_CONTRACT;
 
-    if (ObjIsInstanceOfNoGC(element, arr->GetArrayElementTypeHandle()) == TypeHandle::CanCast)
+    if (CastCache::TryGetFromCache(element->GetMethodTable(), arr->GetArrayElementTypeHandle()) == TypeHandle::CanCast)
         return;
     
     FC_INNER_RETURN_VOID(ArrayTypeCheckSlow(element, arr));
