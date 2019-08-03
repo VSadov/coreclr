@@ -11,22 +11,13 @@
 **
 =============================================================================*/
 
-//TODO: VS need to deal with this.
-#nullable disable
-
-using System.Collections.Concurrent;
+using Internal.Runtime.CompilerServices;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Diagnostics.CodeAnalysis;
 using System.Diagnostics.Tracing;
 using System.Runtime.CompilerServices;
-using System.Runtime.ConstrainedExecution;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
-using Internal.Runtime.CompilerServices;
-
-//TODO: VS remove
-// [assembly: System.Diagnostics.Debuggable(true, true)]
 
 namespace System.Threading
 {
@@ -85,7 +76,7 @@ namespace System.Threading
             /// Lock used to protect cross-segment operations"/>
             /// and any operations that need to get a consistent view of them.
             /// </summary>
-            internal object _addSegmentLock;
+            internal object _addSegmentLock = new object();
 
             [StructLayout(LayoutKind.Explicit, Size = 3 * Internal.PaddingHelpers.CACHE_LINE_SIZE)] // padding before/between/after fields
             internal struct PaddedQueueEnds
@@ -157,7 +148,7 @@ namespace System.Threading
                 internal struct Slot
                 {
                     /// <summary>The item.</summary>
-                    internal object Item;
+                    internal object? Item;
                     /// <summary>The sequence number for this slot, used to synchronize between enqueuers and dequeuers.</summary>
                     internal int SequenceNumber;
                 }
@@ -189,7 +180,6 @@ namespace System.Threading
             /// </summary>
             internal GlobalQueue()
             {
-                _addSegmentLock = new object();
                 _enqSegment = _deqSegment = new GlobalQueueSegment(InitialSegmentLength);
             }
 
@@ -199,7 +189,7 @@ namespace System.Threading
                 get
                 {
                     int count = 0;
-                    for (var s = _deqSegment; s != null; s = s._nextSegment)
+                    for (GlobalQueueSegment? s = _deqSegment; s != null; s = s._nextSegment)
                     {
                         count += s.Count;
                     }
@@ -264,7 +254,7 @@ namespace System.Threading
             /// Removes an object at the bottom of the queue
             /// Returns null if the queue is empty.
             /// </summary>
-            internal object Dequeue()
+            internal object? Dequeue()
             {
                 var currentSegment = _deqSegment;
                 if (currentSegment.IsEmpty)
@@ -272,7 +262,7 @@ namespace System.Threading
                     return null;
                 }
 
-                object result = currentSegment.TryDequeue();
+                object? result = currentSegment.TryDequeue();
 
                 if (result == null && currentSegment._nextSegment != null)
                 {
@@ -286,9 +276,9 @@ namespace System.Threading
             /// <summary>
             /// Slow path for Dequeue, removing frozen segments as needed.
             /// </summary>
-            private object TryDequeueSlow(GlobalQueueSegment currentSegment)
+            private object? TryDequeueSlow(GlobalQueueSegment currentSegment)
             {
-                object result;
+                object? result;
                 for (; ; )
                 {
                     // At this point we know that this segment has been frozen for additional enqueues. But between
@@ -341,7 +331,7 @@ namespace System.Threading
             internal sealed class GlobalQueueSegment : QueueSegmentBase
             {
                 /// <summary>The segment following this one in the queue, or null if this segment is the last in the queue.</summary>
-                internal GlobalQueueSegment _nextSegment;
+                internal GlobalQueueSegment? _nextSegment;
 
                 /// <summary>Creates the segment.</summary>
                 /// <param name="length">
@@ -422,7 +412,7 @@ namespace System.Threading
                 }
 
                 /// <summary>Tries to dequeue an element from the queue.</summary>
-                internal object TryDequeue()
+                internal object? TryDequeue()
                 {
                     // Loop in case of contention...
                     var spinner = new SpinWait();
@@ -524,7 +514,7 @@ namespace System.Threading
                 get
                 {
                     int count = 0;
-                    for (var s = _deqSegment; s != null; s = s._nextSegment)
+                    for (LocalQueueSegment? s = _deqSegment; s != null; s = s._nextSegment)
                     {
                         count += s.Count;
                     }
@@ -597,10 +587,10 @@ namespace System.Threading
             /// Returns null if the queue is empty or if there is a contention 
             /// (no point to dwell on one local queue and make problem worse when there are other queues).
             /// </summary>
-            internal object Dequeue(ref bool missedSteal)
+            internal object? Dequeue(ref bool missedSteal)
             {
                 var currentSegment = _deqSegment;
-                var result = currentSegment.TryDequeue(ref missedSteal);
+                object? result = currentSegment.TryDequeue(ref missedSteal);
 
                 // if there is a new segment, we must help with retiring the current.
                 if (result == null && currentSegment._nextSegment != null)
@@ -614,9 +604,9 @@ namespace System.Threading
             /// <summary>
             /// Tries to dequeue an item, removing frozen segments as needed.
             /// </summary>
-            private object TryDequeueSlow(LocalQueueSegment currentSegment, ref bool missedSteal)
+            private object? TryDequeueSlow(LocalQueueSegment currentSegment, ref bool missedSteal)
             {
-                object result;
+                object? result;
                 for (; ; )
                 {
                     // At this point we know that this segment has been frozen for additional enqueues. But between
@@ -669,7 +659,7 @@ namespace System.Threading
             /// Pops an item from the top of the queue.
             /// Returns null if there is nothing to pop or there is a contention.
             /// </summary>
-            internal object TryPop()
+            internal object? TryPop()
             {
                 return _enqSegment.TryPop();
             }
@@ -694,7 +684,7 @@ namespace System.Threading
             internal sealed class LocalQueueSegment : QueueSegmentBase
             {
                 /// <summary>The segment following this one in the queue, or null if this segment is the last in the queue.</summary>
-                internal LocalQueueSegment _nextSegment;
+                internal LocalQueueSegment? _nextSegment;
 
                 /// <summary>
                 /// Another state of the slot in addition to Empty and Full.
@@ -716,7 +706,7 @@ namespace System.Threading
                 /// <summary>
                 /// When a segment has more than this, we take half its slots.
                 /// </summary>
-                private const int RichCount = 32;  //TODO: (vsadov) 64?
+                private const int RichCount = 32;
 
                 /// <summary>Creates the segment.</summary>
                 /// <param name="length">
@@ -800,9 +790,9 @@ namespace System.Threading
                             return false;
                         }
 
-                        // Lost a race. Most likely to the dequeuer of the last remaining item, which will be gone shortly. 
-                        // Try again.
-                        // TODO: (vsadov) we only need a compiler fence here. As long as we re-read Enqueue, it could be an ordinary read.
+                        // Lost a race. Most likely to the dequeuer of the last remaining item, which will be gone shortly. Try again.
+                        // NOTE: We only need a compiler fence here. As long as we re-read Enqueue, it could be an ordinary read.
+                        //       This is not a common code path though.
                         position = Volatile.Read(ref _queueEnds.Enqueue);
                     }
                 }
@@ -810,7 +800,7 @@ namespace System.Threading
                 // for debugging
                 internal int Count => _queueEnds.Enqueue - _queueEnds.Dequeue;
 
-                internal object TryPop()
+                internal object? TryPop()
                 {
                     for (; ; )
                     {
@@ -873,7 +863,7 @@ namespace System.Threading
                 /// That generally happens when another thread did or is doing modifications and we do not see all the changes.
                 /// We could spin here until we see a consistent state, but it makes more sense to look in other queues.
                 /// </summary>
-                internal object TryDequeue(ref bool missedSteal)
+                internal object? TryDequeue(ref bool missedSteal)
                 {
                     for (; ; )
                     {
@@ -901,7 +891,7 @@ namespace System.Threading
                             // Reserve the slot for Dequeuing.
                             if (Interlocked.CompareExchange(ref slot.SequenceNumber, position + Change, sequenceNumber) == sequenceNumber)
                             {
-                                object item;
+                                object? item;
                                 var enqPos = _queueEnds.Enqueue;
 
                                 if (enqPos - position < RichCount ||
@@ -957,7 +947,7 @@ namespace System.Threading
                     }
                 }
 
-                object TryRob(int deqPosition, int enqPosition)
+                object? TryRob(int deqPosition, int enqPosition)
                 {
                     LocalQueueSegment other = ThreadPoolGlobals.workQueue.GetOrAddLocalQueue()._enqSegment;
                     if (this != other)
@@ -1149,7 +1139,7 @@ namespace System.Threading
         /// <summary>
         /// Returns a local queue softly affinitized with the current thread.
         /// </summary>
-        internal LocalQueue GetLocalQueue()
+        internal LocalQueue? GetLocalQueue()
         {
             return _localQueues[GetLocalQueueIndex()];
         }
@@ -1163,7 +1153,7 @@ namespace System.Threading
             if (result == null)
             {
                 var newQueue = new LocalQueue();
-                Interlocked.CompareExchange(ref _localQueues[index], newQueue, null);
+                Interlocked.CompareExchange(ref _localQueues[index], newQueue, null!);
                 result = _localQueues[index];
             }
 
@@ -1254,14 +1244,14 @@ namespace System.Threading
             return GetLocalQueue()?.TryRemove(callback) ?? false;
         }
 
-        public object PopLocal(int localQueueIndex)
+        public object? PopLocal(int localQueueIndex)
         {
             return _localQueues[localQueueIndex]?.TryPop();
         }
 
-        public object DequeueAny(ref bool missedSteal, LocalQueue localQueue)
+        public object? DequeueAny(ref bool missedSteal, LocalQueue? localQueue)
         {
-            object callback = _globalQueue.Dequeue();
+            object? callback = _globalQueue.Dequeue();
             if (callback == null)
             {
                 LocalQueue[] queues = _localQueues;
@@ -1368,7 +1358,7 @@ namespace System.Threading
                 do
                 {
                     var localQueue = workQueue.GetLocalQueue();
-                    object workItem = localQueue?.TryPop();
+                    object? workItem = localQueue?.TryPop();
 
                     if (workItem == null)
                     {
@@ -1475,9 +1465,9 @@ namespace System.Threading
             }
         }
     }
-    public delegate void WaitCallback(object state);
+    public delegate void WaitCallback(object? state);
 
-    public delegate void WaitOrTimerCallback(object state, bool timedOut);  // signaled or timed out
+    public delegate void WaitOrTimerCallback(object? state, bool timedOut);  // signaled or timed out
 
     internal abstract class QueueUserWorkItemCallbackBase : IThreadPoolWorkItem
     {
@@ -1489,8 +1479,7 @@ namespace System.Threading
         {
             Interlocked.MemoryBarrier(); // ensure that an old cached value is not read below
             Debug.Assert(
-                executed != 0 || Environment.HasShutdownStarted,
-                "A QueueUserWorkItemCallback was never called!");
+                executed != 0, "A QueueUserWorkItemCallback was never called!");
         }
 #endif
 
@@ -1507,19 +1496,20 @@ namespace System.Threading
 
     internal sealed class QueueUserWorkItemCallback : QueueUserWorkItemCallbackBase
     {
-        private WaitCallback _callback; // SOS's ThreadPool command depends on this name
-        private readonly object _state;
+        private WaitCallback? _callback; // SOS's ThreadPool command depends on this name
+        private readonly object? _state;
         private readonly ExecutionContext _context;
 
         private static readonly Action<QueueUserWorkItemCallback> s_executionContextShim = quwi =>
         {
+            Debug.Assert(quwi._callback != null);
             WaitCallback callback = quwi._callback;
             quwi._callback = null;
 
             callback(quwi._state);
         };
 
-        internal QueueUserWorkItemCallback(WaitCallback callback, object state, ExecutionContext context)
+        internal QueueUserWorkItemCallback(WaitCallback callback, object? state, ExecutionContext context)
         {
             Debug.Assert(context != null);
 
@@ -1538,7 +1528,7 @@ namespace System.Threading
 
     internal sealed class QueueUserWorkItemCallback<TState> : QueueUserWorkItemCallbackBase
     {
-        private Action<TState> _callback; // SOS's ThreadPool command depends on this name
+        private Action<TState>? _callback; // SOS's ThreadPool command depends on this name
         private readonly TState _state;
         private readonly ExecutionContext _context;
 
@@ -1555,6 +1545,7 @@ namespace System.Threading
         {
             base.Execute();
 
+            Debug.Assert(_callback != null);
             Action<TState> callback = _callback;
             _callback = null;
 
@@ -1564,10 +1555,10 @@ namespace System.Threading
 
     internal sealed class QueueUserWorkItemCallbackDefaultContext : QueueUserWorkItemCallbackBase
     {
-        private WaitCallback _callback; // SOS's ThreadPool command depends on this name
-        private readonly object _state;
+        private WaitCallback? _callback; // SOS's ThreadPool command depends on this name
+        private readonly object? _state;
 
-        internal QueueUserWorkItemCallbackDefaultContext(WaitCallback callback, object state)
+        internal QueueUserWorkItemCallbackDefaultContext(WaitCallback callback, object? state)
         {
             Debug.Assert(callback != null);
 
@@ -1580,6 +1571,7 @@ namespace System.Threading
             ExecutionContext.CheckThreadPoolAndContextsAreDefault();
             base.Execute();
 
+            Debug.Assert(_callback != null);
             WaitCallback callback = _callback;
             _callback = null;
 
@@ -1591,7 +1583,7 @@ namespace System.Threading
 
     internal sealed class QueueUserWorkItemCallbackDefaultContext<TState> : QueueUserWorkItemCallbackBase
     {
-        private Action<TState> _callback; // SOS's ThreadPool command depends on this name
+        private Action<TState>? _callback; // SOS's ThreadPool command depends on this name
         private readonly TState _state;
 
         internal QueueUserWorkItemCallbackDefaultContext(Action<TState> callback, TState state)
@@ -1607,6 +1599,7 @@ namespace System.Threading
             ExecutionContext.CheckThreadPoolAndContextsAreDefault();
             base.Execute();
 
+            Debug.Assert(_callback != null);
             Action<TState> callback = _callback;
             _callback = null;
 
@@ -1616,15 +1609,15 @@ namespace System.Threading
         }
     }
 
-    internal class _ThreadPoolWaitOrTimerCallback
+    internal sealed class _ThreadPoolWaitOrTimerCallback
     {
         private WaitOrTimerCallback _waitOrTimerCallback;
-        private ExecutionContext _executionContext;
-        private object _state;
+        private ExecutionContext? _executionContext;
+        private object? _state;
         private static readonly ContextCallback _ccbt = new ContextCallback(WaitOrTimerCallback_Context_t);
         private static readonly ContextCallback _ccbf = new ContextCallback(WaitOrTimerCallback_Context_f);
 
-        internal _ThreadPoolWaitOrTimerCallback(WaitOrTimerCallback waitOrTimerCallback, object state, bool flowExecutionContext)
+        internal _ThreadPoolWaitOrTimerCallback(WaitOrTimerCallback waitOrTimerCallback, object? state, bool flowExecutionContext)
         {
             _waitOrTimerCallback = waitOrTimerCallback;
             _state = state;
@@ -1636,15 +1629,15 @@ namespace System.Threading
             }
         }
 
-        private static void WaitOrTimerCallback_Context_t(object state) =>
+        private static void WaitOrTimerCallback_Context_t(object? state) =>
             WaitOrTimerCallback_Context(state, timedOut: true);
 
-        private static void WaitOrTimerCallback_Context_f(object state) =>
+        private static void WaitOrTimerCallback_Context_f(object? state) =>
             WaitOrTimerCallback_Context(state, timedOut: false);
 
-        private static void WaitOrTimerCallback_Context(object state, bool timedOut)
+        private static void WaitOrTimerCallback_Context(object? state, bool timedOut)
         {
-            _ThreadPoolWaitOrTimerCallback helper = (_ThreadPoolWaitOrTimerCallback)state;
+            _ThreadPoolWaitOrTimerCallback helper = (_ThreadPoolWaitOrTimerCallback)state!;
             helper._waitOrTimerCallback(helper._state, timedOut);
         }
 
@@ -1653,7 +1646,7 @@ namespace System.Threading
         {
             Debug.Assert(helper != null, "Null state passed to PerformWaitOrTimerCallback!");
             // call directly if it is an unsafe call OR EC flow is suppressed
-            ExecutionContext context = helper._executionContext;
+            ExecutionContext? context = helper._executionContext;
             if (context == null)
             {
                 WaitOrTimerCallback callback = helper._waitOrTimerCallback;
@@ -1672,7 +1665,7 @@ namespace System.Threading
         public static RegisteredWaitHandle RegisterWaitForSingleObject(
              WaitHandle waitObject,
              WaitOrTimerCallback callBack,
-             object state,
+             object? state,
              uint millisecondsTimeOutInterval,
              bool executeOnlyOnce    // NOTE: we do not allow other options that allow the callback to be queued as an APC
              )
@@ -1686,7 +1679,7 @@ namespace System.Threading
         public static RegisteredWaitHandle UnsafeRegisterWaitForSingleObject(
              WaitHandle waitObject,
              WaitOrTimerCallback callBack,
-             object state,
+             object? state,
              uint millisecondsTimeOutInterval,
              bool executeOnlyOnce    // NOTE: we do not allow other options that allow the callback to be queued as an APC
              )
@@ -1699,7 +1692,7 @@ namespace System.Threading
         public static RegisteredWaitHandle RegisterWaitForSingleObject(
              WaitHandle waitObject,
              WaitOrTimerCallback callBack,
-             object state,
+             object? state,
              int millisecondsTimeOutInterval,
              bool executeOnlyOnce    // NOTE: we do not allow other options that allow the callback to be queued as an APC
              )
@@ -1712,7 +1705,7 @@ namespace System.Threading
         public static RegisteredWaitHandle UnsafeRegisterWaitForSingleObject(
              WaitHandle waitObject,
              WaitOrTimerCallback callBack,
-             object state,
+             object? state,
              int millisecondsTimeOutInterval,
              bool executeOnlyOnce    // NOTE: we do not allow other options that allow the callback to be queued as an APC
              )
@@ -1725,7 +1718,7 @@ namespace System.Threading
         public static RegisteredWaitHandle RegisterWaitForSingleObject(
             WaitHandle waitObject,
             WaitOrTimerCallback callBack,
-            object state,
+            object? state,
             long millisecondsTimeOutInterval,
             bool executeOnlyOnce    // NOTE: we do not allow other options that allow the callback to be queued as an APC
         )
@@ -1740,7 +1733,7 @@ namespace System.Threading
         public static RegisteredWaitHandle UnsafeRegisterWaitForSingleObject(
             WaitHandle waitObject,
             WaitOrTimerCallback callBack,
-            object state,
+            object? state,
             long millisecondsTimeOutInterval,
             bool executeOnlyOnce    // NOTE: we do not allow other options that allow the callback to be queued as an APC
         )
@@ -1755,7 +1748,7 @@ namespace System.Threading
         public static RegisteredWaitHandle RegisterWaitForSingleObject(
                           WaitHandle waitObject,
                           WaitOrTimerCallback callBack,
-                          object state,
+                          object? state,
                           TimeSpan timeout,
                           bool executeOnlyOnce
                           )
@@ -1771,7 +1764,7 @@ namespace System.Threading
         public static RegisteredWaitHandle UnsafeRegisterWaitForSingleObject(
                           WaitHandle waitObject,
                           WaitOrTimerCallback callBack,
-                          object state,
+                          object? state,
                           TimeSpan timeout,
                           bool executeOnlyOnce
                           )
@@ -1787,7 +1780,7 @@ namespace System.Threading
         public static bool QueueUserWorkItem(WaitCallback callBack) =>
             QueueUserWorkItem(callBack, null);
 
-        public static bool QueueUserWorkItem(WaitCallback callBack, object state)
+        public static bool QueueUserWorkItem(WaitCallback callBack, object? state)
         {
             if (callBack == null)
             {
@@ -1796,11 +1789,11 @@ namespace System.Threading
 
             EnsureInitialized();
 
-            ExecutionContext context = ExecutionContext.Capture();
+            ExecutionContext? context = ExecutionContext.Capture();
 
             object tpcallBack = (context == null || context.IsDefault) ?
-                new QueueUserWorkItemCallbackDefaultContext(callBack, state) :
-                (object)new QueueUserWorkItemCallback(callBack, state, context);
+                new QueueUserWorkItemCallbackDefaultContext(callBack!, state) :
+                (object)new QueueUserWorkItemCallback(callBack!, state, context);
 
             ThreadPoolGlobals.workQueue.Enqueue(tpcallBack, forceGlobal: true);
 
@@ -1816,11 +1809,11 @@ namespace System.Threading
 
             EnsureInitialized();
 
-            ExecutionContext context = ExecutionContext.Capture();
+            ExecutionContext? context = ExecutionContext.Capture();
 
             object tpcallBack = (context == null || context.IsDefault) ?
-                new QueueUserWorkItemCallbackDefaultContext<TState>(callBack, state) :
-                (object)new QueueUserWorkItemCallback<TState>(callBack, state, context);
+                new QueueUserWorkItemCallbackDefaultContext<TState>(callBack!, state) :
+                (object)new QueueUserWorkItemCallback<TState>(callBack!, state, context);
 
             ThreadPoolGlobals.workQueue.Enqueue(tpcallBack, forceGlobal: !preferLocal);
 
@@ -1848,19 +1841,19 @@ namespace System.Threading
                     ThrowHelper.ThrowArgumentOutOfRangeException(ExceptionArgument.state);
                 }
 
-                UnsafeQueueUserWorkItemInternal((object)state, preferLocal);
+                UnsafeQueueUserWorkItemInternal((object)state!, preferLocal);
                 return true;
             }
 
             EnsureInitialized();
 
             ThreadPoolGlobals.workQueue.Enqueue(
-                new QueueUserWorkItemCallbackDefaultContext<TState>(callBack, state), forceGlobal: !preferLocal);
+                new QueueUserWorkItemCallbackDefaultContext<TState>(callBack!, state), forceGlobal: !preferLocal);
 
             return true;
         }
 
-        public static bool UnsafeQueueUserWorkItem(WaitCallback callBack, object state)
+        public static bool UnsafeQueueUserWorkItem(WaitCallback callBack, object? state)
         {
             if (callBack == null)
             {
@@ -1869,7 +1862,7 @@ namespace System.Threading
 
             EnsureInitialized();
 
-            object tpcallBack = new QueueUserWorkItemCallbackDefaultContext(callBack, state);
+            object tpcallBack = new QueueUserWorkItemCallbackDefaultContext(callBack!, state);
 
             ThreadPoolGlobals.workQueue.Enqueue(tpcallBack, forceGlobal: true);
 
@@ -1889,7 +1882,7 @@ namespace System.Threading
                 ThrowHelper.ThrowArgumentOutOfRangeException(ExceptionArgument.callBack);
             }
 
-            UnsafeQueueUserWorkItemInternal(callBack, preferLocal);
+            UnsafeQueueUserWorkItemInternal(callBack!, preferLocal);
             return true;
         }
 
@@ -1927,11 +1920,11 @@ namespace System.Threading
             {
                 if (wsq != null)
                 {
-                    for (var s = wsq._deqSegment; s != null; s = s._nextSegment)
+                    for (ThreadPoolWorkQueue.LocalQueue.LocalQueueSegment? s = wsq._deqSegment; s != null; s = s._nextSegment)
                     {
                         foreach (var slot in s._slots)
                         {
-                            object item = slot.Item;
+                            object? item = slot.Item;
                             if (item != null)
                             {
                                 yield return item;
@@ -1944,14 +1937,14 @@ namespace System.Threading
 
         internal static IEnumerable<object> GetLocallyQueuedWorkItems()
         {
-            ThreadPoolWorkQueue.LocalQueue wsq = ThreadPoolGlobals.workQueue.GetLocalQueue();
+            ThreadPoolWorkQueue.LocalQueue? wsq = ThreadPoolGlobals.workQueue.GetLocalQueue();
             if (wsq != null)
             {
-                for (var s = wsq._deqSegment; s != null; s = s._nextSegment)
+                for (ThreadPoolWorkQueue.LocalQueue.LocalQueueSegment? s = wsq._deqSegment; s != null; s = s._nextSegment)
                 {
                     foreach (var slot in s._slots)
                     {
-                        object item = slot.Item;
+                        object? item = slot.Item;
                         if (item != null)
                         {
                             yield return item;
@@ -1966,11 +1959,11 @@ namespace System.Threading
             var workQueue = ThreadPoolGlobals.workQueue;
 
             // Enumerate global queue
-            for (var s = workQueue._globalQueue._deqSegment; s != null; s = s._nextSegment)
+            for (ThreadPoolWorkQueue.GlobalQueue.GlobalQueueSegment? s = workQueue._globalQueue._deqSegment; s != null; s = s._nextSegment)
             {
                 foreach (var slot in s._slots)
                 {
-                    object item = slot.Item;
+                    object? item = slot.Item;
                     if (item != null)
                     {
                         yield return item;
