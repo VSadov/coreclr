@@ -3321,7 +3321,7 @@ HCIMPLEND
 /* assigns 'val to 'array[idx], after doing all the proper checks */
 
 // TODO: I JUST WANT TO CHECK IF THIS PASSES TESTS, WILL REVERT
-F_CALL_CONV void JIT_Stelem_Ref(PtrArray* array, unsigned idx, Object *val)
+void F_CALL_CONV JIT_Stelem_Ref(PtrArray* array, unsigned idx, Object *val)
 {    
     FCALL_CONTRACT;
 
