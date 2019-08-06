@@ -461,11 +461,13 @@ namespace System.Threading
         }
 
         /// <summary>
-        /// The "local" flavor of the queue is similar to the "global", but also supports Pop and Remove operations.
+        /// The "local" flavor of the queue is similar to the "global", but also supports Pop, Remove and Rob operations.
         /// 
         /// - Pop is used to implement Busy-Leaves scheduling strategy.
         /// - Remove is used when the caller finds it benefitial to execute a workitem "inline" after it has been scheduled. 
         ///   (such as waiting on a task completion).
+        /// - Rob is used to rebalance queues if one is found to be "rich" by stealing 1/2 of its queue. 
+        ///   (this way we avoid having to continue stealing from the same single queue, Rob may lead to 2 rich queues, then 4, then ...)  
         /// 
         /// We create multiple local queues and softly affinitize them with CPU cores.
         /// </summary>
@@ -678,7 +680,37 @@ namespace System.Threading
             /// enqueues fail and return false.  When the queue is empty, dequeues fail and return null.
             /// These segments are linked together to form the unbounded queue.
             /// 
-            /// The "local" flavor of the queue also supports Pop or Remove operations as needed by the Busy Leaves algorithm.
+            /// The main difference of "local" segment from "global" is support for Pop as needed by the Busy Leaves algorithm.
+            /// 
+            /// Supporting Pop leads to some additional complexity compared to "global" segment.
+            /// In particular enqueue index may move both forward and backward and therefore we cannot rely on exclusive 
+            /// update of the enqueue index as a way to acquire access to Enqueue or Pop a slot.
+            /// Another issue to be aware is the concurrent Dequeue and Pop. 
+            /// 
+            /// We resolve all the issues above by supporting the following invariants:
+            /// 
+            /// - dequeue and enqueue ends of the segment never cross. 
+            ///   In an empty segment dequeue and enqueue ends point to the same slot.     
+            ///   
+            /// - Dequeue operation must acquire access to the dequeue slot by atomically moving it to the "Change" state. 
+            ///   Setting the slot to the next state can be done via regular write. After the Dequeue is complete and dequeue end is moved forward.
+            ///   
+            /// - Pop and Enqueue operation must acquire the access to enqueue slot by atomically moving the previous slot to "Change".
+            ///   Setting the next state can be done via regular write. After the Enqueue/Pop is complete and enqueue end is moved appropriately.
+            ///   
+            /// - It is possible in a case of a contention to set "Change" on a wrong slot. 
+            ///   Such cases are rare and can be detected by re-examining whether the slot is the right one after the locking change.
+            ///   In such case we revert the "Change" and handle contention via appropriate backoff.
+            ///   The reverting of failed enqueue lock is done via CAS - in case if the slot has changed the state due to robbing.
+            ///   The reverting of failed dequeue lock is an ordinary write. Since dequeue moves monotonically, it cannot end up in robbing range.
+            /// 
+            /// Essentially, in a rare case of concurrent Pop and Enqueue, the threads coordinate the access by locking the same slot.
+            /// Similarly concurrent Dequeue will coordinate the access on the other end of the segment.
+            /// When segment shrinks to just 1 element, all Pop/Enqueue/Dequeue operations would be using the same coordinating slot. 
+            /// This guarantees that Pop and Dequeue cannot move across each other.
+            /// 
+            /// - Rob/Remove operations get exclusive access to appropriate ranges of slots by setting "Change" on both sides of the range.
+            /// 
             /// </summary>
             [DebuggerDisplay("Count = {Count}")]
             internal sealed class LocalQueueSegment : QueueSegmentBase
@@ -792,7 +824,7 @@ namespace System.Threading
 
                         // Lost a race. Most likely to the dequeuer of the last remaining item, which will be gone shortly. Try again.
                         // NOTE: We only need a compiler fence here. As long as we re-read Enqueue, it could be an ordinary read.
-                        //       This is not a common code path though.
+                        //       This is not a common code path though, so volatile read will do.
                         position = Volatile.Read(ref _queueEnds.Enqueue);
                     }
                 }
@@ -807,7 +839,7 @@ namespace System.Threading
                         int position = _queueEnds.Enqueue - 1;
                         ref Slot slot = ref this[position];
 
-                        // Read the sequence number for the cell.
+                        // Read the sequence number for the slot.
                         int sequenceNumber = slot.SequenceNumber;
 
                         // Check if the slot is considered Full in the current generation (other likely state - Empty).
@@ -881,7 +913,7 @@ namespace System.Threading
                             missedSteal = Volatile.Read(ref this[position - 1].SequenceNumber) != (position + _slotsMask);
                         }
 
-                        // Read the sequence number for the cell.
+                        // Read the sequence number for the slot.
                         ref Slot slot = ref this[position];
                         int sequenceNumber = slot.SequenceNumber;
 
@@ -958,7 +990,7 @@ namespace System.Threading
                         int prevSequenceNumber = enqPrevSlot.SequenceNumber;
 
                         var srcSlotsMask = _slotsMask;
-                        // mask in case it is frozen and enqueue is inflated
+                        // mask in case the segment is frozen and enqueue is inflated
                         var count = (enqPosition - deqPosition) & srcSlotsMask;
                         int halfPosition = deqPosition + count / 2;
                         ref Slot halfSlot = ref this[halfPosition];
@@ -980,7 +1012,7 @@ namespace System.Threading
                                     {
                                         // our enqueue could have changed before we locked half
                                         // make sure that half-way slot is still before enqueue
-                                        // in fact give it more space - we do not want to rob all the items, especially if it is popping them fast.
+                                        // in fact give it more space - we do not want to rob all the items, especially if someone else popping them fast.
                                         var enq = deqPosition + ((_queueEnds.Enqueue - deqPosition) & _slotsMask);
                                         if (enq - halfPosition > (RichCount / 4))
                                         {
@@ -1001,7 +1033,7 @@ namespace System.Threading
 
                                                 to.Item = last.Item;
                                                 // NB: enables "to" for dequeuing, which may immediately happen,
-                                                // but not for popping, yet - since other enq is locked
+                                                // but not for popping, yet - since the other enq is locked
                                                 Volatile.Write(ref to.SequenceNumber, j + Full);
 
                                                 last.Item = null;
@@ -1019,7 +1051,7 @@ namespace System.Threading
                                             var result = last.Item;
                                             last.Item = null;
 
-                                            // restore half slot, must be after all full->empty slot transitioning 
+                                            // restore half slot, must be after all the full->empty slot transitioning 
                                             // to make sure that poppers cannot see robbed slots as still incorrectly full when moving to the left of half.
                                             Volatile.Write(ref halfSlot.SequenceNumber, halfPosition + Full);
 
@@ -1036,7 +1068,7 @@ namespace System.Threading
                                             return result;
                                         }
 
-                                        // failed to lock desired half-way slot.
+                                        // failed to lock the half-way slot.
                                         // restore via CAS, in case target slot has been robbed to
                                         Interlocked.CompareExchange(ref halfSlot.SequenceNumber, halfPosition + Full, halfPosition + Change);
                                     }
@@ -1063,7 +1095,7 @@ namespace System.Threading
                         ref Slot slot = ref this[position];
                         if (slot.Item == callback)
                         {
-                            // lock Dequeue (so that the slot would not be robbed while we are taking it)
+                            // lock Dequeue (so that the slot would not be robbed while we are removing)
                             var deqPosition = _queueEnds.Dequeue;
                             ref var deqSlot = ref this[deqPosition];
                             if (Interlocked.CompareExchange(ref deqSlot.SequenceNumber, deqPosition + Change, deqPosition + Full) == deqPosition + Full)
