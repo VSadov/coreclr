@@ -3261,58 +3261,103 @@ HCIMPL2(LPVOID, ArrayStoreCheck, Object** pElement, PtrArray** pArray)
 }
 HCIMPLEND
 
-/****************************************************************************/
-/* assigns 'val to 'array[idx], after doing all the proper checks */
+NOINLINE HCIMPL3(void, JIT_Stelem_Ref_Framed, PtrArray* array, uintptr_t idx, Object* val)
+{
+    FCALL_CONTRACT;
+    
+    OBJECTREF arrRef = ObjectToOBJECTREF(array);
+    OBJECTREF valRef = ObjectToOBJECTREF(val);
 
-HCIMPL3(void, JIT_Stelem_Ref, PtrArray* array, unsigned idx, Object *val)
+    HELPER_METHOD_FRAME_BEGIN_2(arrRef, valRef);
+    // call "Core" version directly since all the callers do the "NoGC" call first and that checks the cache 
+    if (!ObjIsInstanceOfCore(val, array->GetArrayElementTypeHandle()))
+        COMPlusThrow(kArrayTypeMismatchException);
+
+    HELPER_METHOD_FRAME_END();
+
+    array = (PtrArray*)OBJECTREFToObject(arrRef);
+    val = OBJECTREFToObject(valRef);
+
+    HCCALL2(JIT_WriteBarrier, (Object**)&array->m_Array[idx], val);
+}
+HCIMPLEND
+
+#include <optsmallperfcritical.h>
+#pragma optimize("x", on)
+
+HCIMPL3(void, JIT_Stelem_Ref_Helper, PtrArray* array, uintptr_t idx, Object* val)
 {
     FCALL_CONTRACT;
 
     if (!array) 
     {
-        FCThrowVoid(kNullReferenceException);
-    }
-    if (idx >= array->GetNumComponents()) 
-    {
-        FCThrowVoid(kIndexOutOfRangeException);
+        HCCALL1(JIT_InternalThrow, kNullReferenceException);
     }
 
-    if (val) 
+    if (idx >= array->GetNumComponents())
     {
-        MethodTable *valMT = val->GetMethodTable();
-        TypeHandle arrayElemTH = array->GetArrayElementTypeHandle();
+        HCCALL1(JIT_InternalThrow, kIndexOutOfRangeException);
+    }
 
-        if (arrayElemTH != TypeHandle(valMT) && arrayElemTH != TypeHandle(g_pObjectClass))
-        {   
-            TypeHandle::CastResult result = CastCache::TryGetFromCache(valMT, arrayElemTH);
+    MethodTable* valMT = val->GetMethodTable();
+    TypeHandle arrayElemTH = array->GetArrayElementTypeHandle();
 
-            if (result != TypeHandle::CanCast)
-            {
-                // FCALL_CONTRACT increase ForbidGC count.  Normally, HELPER_METHOD_FRAME macros decrease the count.
-                // But to avoid perf hit, we manually decrease the count here before calling another HCCALL.
-                ENDFORBIDGC();
-
-                if (HCCALL2(ArrayStoreCheck,(Object**)&val, (PtrArray**)&array) != NULL)
-                {
-                    // This return is never executed. It helps epilog walker to find its way out.
-                    return;
-                }
-            }
-        }
-
+    if (CastCache::TryGetFromCache(valMT, arrayElemTH) == TypeHandle::CanCast)
+    {
         // The performance gain of the optimized JIT_Stelem_Ref is mainly due to 
         // calling JIT_WriteBarrier directly here
-        HCCALL2(JIT_WriteBarrier, (Object **)&array->m_Array[idx], val);
+        HCCALL2(JIT_WriteBarrier, (Object**) & array->m_Array[idx], val);
+        return;
     }
-    else
-    {
-        // no need to go through write-barrier for NULL
-        ClearObjectReference(&array->m_Array[idx]);
-    }
+
+    // FCALL_CONTRACT increase ForbidGC count.  Normally, HELPER_METHOD_FRAME macros decrease the count.
+    // But to avoid perf hit, we manually decrease the count here before calling another HCCALL.
+    ENDFORBIDGC();
+    HCCALL3(JIT_Stelem_Ref_Framed, array, idx, val);
 }
 HCIMPLEND
 
+/****************************************************************************/
+/* assigns 'val to 'array[idx], after doing all the proper checks */
 
+// TODO: I JUST WANT TO CHECK IF THIS PASSES TESTS, WILL REVERT
+F_CALL_CONV void JIT_Stelem_Ref(PtrArray* array, unsigned idx, Object *val)
+{    
+    FCALL_CONTRACT;
+
+    size_t i = idx;
+
+    if (array && i < array->GetNumComponents())
+    {
+        TypeHandle arrayElemTH = array->GetArrayElementTypeHandle();
+
+        if (val)
+        {
+            MethodTable* valMT = val->GetMethodTable();
+            if (arrayElemTH == TypeHandle(valMT))
+            {
+                // The performance gain of the optimized JIT_Stelem_Ref is mainly due to 
+                // calling JIT_WriteBarrier directly here
+                HCCALL2(JIT_WriteBarrier, (Object**) & array->m_Array[i], val);
+                return;
+            }
+        }
+        else
+        {
+            // no need to go through write-barrier for NULL
+            ClearObjectReference(&array->m_Array[i]);
+            return;
+        }
+    }
+
+    // FCALL_CONTRACT increase ForbidGC count.  Normally, HELPER_METHOD_FRAME macros decrease the count.
+    // But to avoid perf hit, we manually decrease the count here before calling another HCCALL.
+    ENDFORBIDGC();
+    JIT_Stelem_Ref_Helper(array, i, val);
+}
+
+#undef TAILCALL_ONLY
+#include <optdefault.h>
 
 //========================================================================
 //
