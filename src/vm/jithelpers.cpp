@@ -3283,7 +3283,10 @@ NOINLINE HCIMPL3(void, JIT_Stelem_Ref_Framed, PtrArray* array, uintptr_t idx, Ob
 HCIMPLEND
 
 #include <optsmallperfcritical.h>
+
+#if defined(_MSC_VER)
 #pragma optimize("x", on)
+#endif
 
 HCIMPL3(void, JIT_Stelem_Ref_Helper, PtrArray* array, uintptr_t idx, Object* val)
 {
