@@ -3101,7 +3101,7 @@ void gc_heap::fire_per_heap_hist_event (gc_history_per_heap* current_gc_data_per
                current_gc_data_per_heap->mechanisms[gc_heap_expand],
                current_gc_data_per_heap->heap_index,
                (void *)(current_gc_data_per_heap->extra_gen0_committed),
-               (max_generation + 2),
+               generation_count,
                (uint32_t)(sizeof (gc_generation_data)),
                (void *)&(current_gc_data_per_heap->gen_data[0]));
 
@@ -4675,7 +4675,8 @@ gc_heap::soh_get_segment_to_expand()
 #endif //BACKGROUND_GC
         )
     {
-        allocator*  gen_alloc = ((settings.condemned_generation == max_generation) ? 0 :
+        assert(settings.condemned_generation <= max_generation);
+        allocator*  gen_alloc = ((settings.condemned_generation == max_generation) ? nullptr :
                               generation_allocator (generation_of (max_generation)));
         dprintf (2, ("(gen%d)soh_get_segment_to_expand", settings.condemned_generation));
 
@@ -38236,7 +38237,7 @@ void PopulateDacVars(GcDacVars *gcDacVars)
     gcDacVars->build_variant = &g_build_variant;
     gcDacVars->gc_structures_invalid_cnt = const_cast<int32_t*>(&GCScan::m_GcStructuresInvalidCnt);
     gcDacVars->generation_size = sizeof(generation);
-    gcDacVars->max_gen = &g_max_generation;
+    gcDacVars->max_gen = max_generation;
 #ifndef MULTIPLE_HEAPS
     gcDacVars->mark_array = &gc_heap::mark_array;
     gcDacVars->ephemeral_heap_segment = reinterpret_cast<dac_heap_segment**>(&gc_heap::ephemeral_heap_segment);

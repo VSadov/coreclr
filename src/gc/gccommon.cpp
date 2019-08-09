@@ -44,7 +44,6 @@ uint32_t* g_gc_card_bundle_table;
 uint8_t* g_gc_lowest_address  = 0;
 uint8_t* g_gc_highest_address = 0;
 GCHeapType g_gc_heap_type = GC_HEAP_INVALID;
-uint32_t g_max_generation = max_generation;
 MethodTable* g_gc_pFreeObjectMethodTable = nullptr;
 uint32_t g_num_processors = 0;
 

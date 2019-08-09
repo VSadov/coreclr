@@ -104,7 +104,26 @@ class IGCHeapInternal;
 
 /* misc defines */
 #define LARGE_OBJECT_SIZE ((size_t)(85000))
-#define max_generation 2
+
+enum generations
+{
+    // small object heap includes generations [0-2], which are "generations" in the general sense. 
+    soh_gen0 = 0,
+    soh_gen1 = 1,
+    soh_gen2 = 2,
+
+    // TODO: VS maybe rename "max_soh_generation" ?
+    max_generation = soh_gen2,
+
+    // large object heap, technically not a generation, but it is convenient to represent it as such
+    loh_generation = 3,
+
+    // pinned heap, a separate generation for the same reasons as loh
+    ph_generation = 4,
+
+    // number of all generations 
+    generation_count = ph_generation + 1
+}
 
 #ifdef GC_CONFIG_DRIVEN
 #define MAX_GLOBAL_GC_MECHANISMS_COUNT 6
@@ -135,7 +154,6 @@ extern "C" uint32_t* g_gc_card_table;
 extern "C" uint8_t* g_gc_lowest_address;
 extern "C" uint8_t* g_gc_highest_address;
 extern "C" GCHeapType g_gc_heap_type;
-extern "C" uint32_t g_max_generation;
 extern "C" MethodTable* g_gc_pFreeObjectMethodTable;
 extern "C" uint32_t g_num_processors;
 
