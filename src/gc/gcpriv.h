@@ -1215,10 +1215,11 @@ public:
     void destroy_gc_heap(gc_heap* heap);
 
     static
-    HRESULT initialize_gc  (size_t segment_size,
-                            size_t heap_size
+    HRESULT initialize_gc  (size_t soh_segment_size,
+                            size_t loh_segment_size,
+                            size_t poh_segment_size
 #ifdef MULTIPLE_HEAPS
-                            , unsigned number_of_heaps
+                            , uint32_t number_of_heaps
 #endif //MULTIPLE_HEAPS
         );
 
@@ -1741,8 +1742,7 @@ protected:
     PER_HEAP
     void adjust_ephemeral_limits();
     PER_HEAP
-    void make_generation (generation& gen, heap_segment* seg,
-                          uint8_t* start, uint8_t* pointer);
+    void make_generation (int gen_num, heap_segment* seg, uint8_t* start, uint8_t* pointer);
 
 
 #define USE_PADDING_FRONT 1
@@ -2663,7 +2663,7 @@ protected:
     /*------------ Multiple non isolated heaps ----------------*/
 #ifdef MULTIPLE_HEAPS
     PER_HEAP_ISOLATED
-    BOOL   create_thread_support (unsigned number_of_heaps);
+    BOOL   create_thread_support (uint32_t number_of_heaps);
     PER_HEAP_ISOLATED
     void destroy_thread_support ();
     PER_HEAP
@@ -2903,8 +2903,9 @@ public:
     BOOL heap_analyze_success;
 
     // The generation table. Must always be last.
+    // TODO: VS +1 for finalizer segment?  why not +2 for critical finalizer?
     PER_HEAP
-    generation generation_table [NUMBERGENERATIONS + 1];
+    generation generation_table [total_generation_count + 1];
 
     // End DAC zone
 
@@ -3234,6 +3235,9 @@ public:
     size_t min_loh_segment_size;
 
     PER_HEAP_ISOLATED
+    size_t min_poh_segment_size;
+
+    PER_HEAP_ISOLATED
     size_t segment_info_size;
 
     PER_HEAP
@@ -3245,9 +3249,9 @@ public:
     PER_HEAP
     BOOL ephemeral_promotion;
     PER_HEAP
-    uint8_t* saved_ephemeral_plan_start[NUMBERGENERATIONS-1];
+    uint8_t* saved_ephemeral_plan_start[soh_generation_count];
     PER_HEAP
-    size_t saved_ephemeral_plan_start_size[NUMBERGENERATIONS-1];
+    size_t saved_ephemeral_plan_start_size[soh_generation_count];
 
 protected:
 #ifdef MULTIPLE_HEAPS
@@ -3685,10 +3689,21 @@ protected:
     PER_HEAP
     alloc_list gen2_alloc_list[NUM_GEN2_ALIST-1];
 
+//TODO: VS need to come up with more meaningfull numbers, for now just use gen2
+#define NUM_POH_ALIST (12)
+#ifdef BIT64
+#define BASE_POH_ALIST (1*256)
+#else
+#define BASE_POH_ALIST (1*128)
+#endif // BIT64
+    PER_HEAP
+    alloc_list poh_alloc_list[NUM_POH_ALIST-1];
+
 //------------------------------------------    
 
     PER_HEAP
-    dynamic_data dynamic_data_table [NUMBERGENERATIONS+1];
+    // TODO: VS why + 1
+    dynamic_data dynamic_data_table [total_generation_count + 1];
 
     PER_HEAP
     gc_history_per_heap gc_data_per_heap;
@@ -4000,12 +4015,12 @@ private:
 
     //adjust the count and add a constant to add a segment
     static const int ExtraSegCount = 2;
-    static const int FinalizerListSeg = NUMBERGENERATIONS+1;
-    static const int CriticalFinalizerListSeg = NUMBERGENERATIONS;
+    static const int FinalizerListSeg = total_generation_count + 1;
+    static const int CriticalFinalizerListSeg = total_generation_count;
     //Does not correspond to a segment
-    static const int FreeList = NUMBERGENERATIONS+ExtraSegCount;
+    static const int FreeList = total_generation_count + ExtraSegCount;
 
-    PTR_PTR_Object m_FillPointers[NUMBERGENERATIONS+ExtraSegCount];
+    PTR_PTR_Object m_FillPointers[total_generation_count + ExtraSegCount];
     PTR_PTR_Object m_Array;
     PTR_PTR_Object m_EndArray;
     size_t   m_PromotedCount;
@@ -4439,6 +4454,9 @@ struct loh_padding_obj
 // for segments whose mark array is only partially committed.
 #define heap_segment_flags_ma_pcommitted 128
 #define heap_segment_flags_loh_delete   256
+
+// TODO: VS reorder, make enum
+#define heap_segment_flags_poh          512
 #endif //BACKGROUND_GC
 
 //need to be careful to keep enough pad items to fit a relocation node
@@ -4578,7 +4596,7 @@ gc_heap*& heap_segment_heap (heap_segment* inst)
 inline
 generation* gc_heap::generation_of (int  n)
 {
-    assert (((n <= max_generation+1) && (n >= 0)));
+    assert (((n < total_generation_count) && (n >= 0)));
     return &generation_table [ n ];
 }
 
