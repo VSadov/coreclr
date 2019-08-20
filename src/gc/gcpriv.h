@@ -1249,12 +1249,12 @@ public:
     static
     void balance_heaps (alloc_context* acontext);
     PER_HEAP
-    ptrdiff_t get_balance_heaps_loh_effective_budget ();
+    ptrdiff_t get_balance_heaps_ploh_effective_budget (int generation_num);
     static 
-    gc_heap* balance_heaps_loh (alloc_context* acontext, size_t size);
-    // Unlike balance_heaps_loh, this may return nullptr if we failed to change heaps.
+    gc_heap* balance_heaps_ploh (alloc_context* acontext, size_t size, int generation_num);
+    // Unlike balance_heaps_ploh, this may return nullptr if we failed to change heaps.
     static
-    gc_heap* balance_heaps_loh_hard_limit_retry (alloc_context* acontext, size_t size);
+    gc_heap* balance_heaps_ploh_hard_limit_retry (alloc_context* acontext, size_t size, int generation_num);
     static
     void gc_thread_stub (void* arg);
 #endif //MULTIPLE_HEAPS
@@ -1266,6 +1266,15 @@ public:
     // lowest_address and highest_address, which are currently the same accross all heaps.
     PER_HEAP
     CObjectHeader* allocate_large_object (size_t size, uint32_t flags, int64_t& alloc_bytes);
+
+
+    // For POH allocations we only update the alloc_bytes_loh in allocation
+    // context - we don't actually use the ptr/limit from it so I am
+    // making this explicit by not passing in the alloc_context.
+    // Note: This is an instance method, but the heap instance is only used for
+    // lowest_address and highest_address, which are currently the same accross all heaps.
+    PER_HEAP
+    CObjectHeader* allocate_pinned_object (size_t size, uint32_t flags, int64_t& alloc_bytes);
 
 #ifdef FEATURE_STRUCTALIGN
     PER_HEAP
@@ -1551,7 +1560,8 @@ protected:
     BOOL a_fit_free_list_large_p (size_t size, 
                                   alloc_context* acontext,
                                   uint32_t flags, 
-                                  int align_const);
+                                  int align_const,
+                                  int gen_number);
 
     PER_HEAP
     BOOL a_fit_segment_end_p (int gen_number,
@@ -1570,7 +1580,7 @@ protected:
                                   BOOL* commit_failed_p,
                                   oom_reason* oom_r);
     PER_HEAP
-    BOOL loh_get_new_seg (generation* gen,
+    BOOL ploh_get_new_seg (generation* gen,
                           size_t size,
                           int align_const,
                           BOOL* commit_failed_p,
@@ -1604,7 +1614,7 @@ protected:
                       BOOL* commit_failed_p,
                       BOOL* short_seg_end_p);
     PER_HEAP
-    BOOL loh_try_fit (int gen_number,
+    BOOL ploh_try_fit (int gen_number,
                       size_t size, 
                       alloc_context* acontext,
                       uint32_t flags, 
@@ -3043,7 +3053,7 @@ public:
     uint64_t total_alloc_bytes_soh;
 
     PER_HEAP
-    uint64_t total_alloc_bytes_loh;
+    uint64_t total_alloc_bytes_ploh;
 
     PER_HEAP
     int gc_policy;  //sweep, compact, expand
@@ -3462,9 +3472,8 @@ protected:
     // in free list doesn't increase the heap size.
     PER_HEAP
     size_t     bgc_loh_size_increased;
-
     PER_HEAP
-    size_t     bgc_loh_allocated_in_free;
+    size_t     bgc_poh_size_increased;
 
     PER_HEAP
     size_t     background_soh_alloc_count;
@@ -3606,7 +3615,7 @@ protected:
     // The more_space_lock and gc_lock is used for 3 purposes:
     //
     // 1) to coordinate threads that exceed their quantum (UP & MP) (more_space_lock_soh)
-    // 2) to synchronize allocations of large objects (more_space_lock_loh)
+    // 2) to synchronize allocations of large objects (more_space_lock_ploh)
     // 3) to synchronize the GC itself (gc_lock)
     //
     PER_HEAP_ISOLATED
@@ -3616,7 +3625,7 @@ protected:
     GCSpinLock more_space_lock_soh; //lock while allocating more space for soh
 
     PER_HEAP
-    GCSpinLock more_space_lock_loh;
+    GCSpinLock more_space_lock_ploh;
 
 #ifdef SYNCHRONIZATION_STATS
 
