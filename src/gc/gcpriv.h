@@ -2637,7 +2637,7 @@ protected:
     PER_HEAP
     size_t committed_size();
     PER_HEAP
-    size_t committed_size (bool loh_p, size_t* allocated);
+    size_t committed_size (int gen_number, size_t* allocated);
     PER_HEAP
     size_t approximate_new_allocation();
     PER_HEAP
@@ -3013,8 +3013,9 @@ public:
     PER_HEAP
     uint32_t fgn_maxgen_percent;
 
+    //TODO: VS need a separate one for pinned?
     PER_HEAP_ISOLATED
-    uint32_t fgn_loh_percent;
+    uint32_t fgn_ploh_percent;
 
     PER_HEAP_ISOLATED
     VOLATILE(bool) full_gc_approach_event_set;
@@ -3458,6 +3459,9 @@ protected:
     size_t     bgc_begin_loh_size;
     PER_HEAP
     size_t     end_loh_size;
+    //TODO: VS used?
+    PER_HEAP
+    size_t     end_poh_size;
 
     // We need to throttle the LOH allocations during BGC since we can't
     // collect LOH when BGC is in progress. 
@@ -3610,7 +3614,8 @@ protected:
     BOOL proceed_with_gc_p;
 
 #define youngest_generation (generation_of (0))
-#define large_object_generation (generation_of (max_generation+1))
+#define large_object_generation (generation_of (loh_generation))
+#define pinned_object_generation (generation_of (poh_generation))
 
     // The more_space_lock and gc_lock is used for 3 purposes:
     //
@@ -4552,9 +4557,9 @@ BOOL heap_segment_unmappable_p (heap_segment* inst)
 }
 
 inline
-BOOL heap_segment_loh_p (heap_segment * inst)
+BOOL heap_segment_ploh_p (heap_segment * inst)
 {
-    return !!(inst->flags & heap_segment_flags_loh);
+    return !!(inst->flags & (heap_segment_flags_loh | heap_segment_flags_poh));
 }
 
 #ifdef BACKGROUND_GC
