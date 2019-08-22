@@ -2661,7 +2661,7 @@ protected:
     PER_HEAP
     void relocate_in_large_objects ();
     PER_HEAP
-    void mark_through_cards_for_large_objects (card_fn fn, BOOL relocating);
+    void mark_through_cards_for_large_objects (card_fn fn, int oldest_gen_num, BOOL relocating);
     PER_HEAP
     void descr_segment (heap_segment* seg);
     PER_HEAP
