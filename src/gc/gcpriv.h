@@ -1732,7 +1732,7 @@ protected:
     void rearrange_small_heap_segments();
 #endif //BACKGROUND_GC
     PER_HEAP
-    void rearrange_large_heap_segments();
+    void rearrange_ploh_segments();
     PER_HEAP
     void rearrange_heap_segments(BOOL compacting);
 
@@ -2657,9 +2657,9 @@ protected:
     PER_HEAP
     void reset_large_object (uint8_t* o);
     PER_HEAP
-    void sweep_large_objects ();
+    void sweep_ploh_objects (generation_num gen_num);
     PER_HEAP
-    void relocate_in_large_objects ();
+    void relocate_in_ploh_objects (generation_num gen_num);
     PER_HEAP
     void mark_through_cards_for_large_objects (card_fn fn, int oldest_gen_num, BOOL relocating);
     PER_HEAP
@@ -3872,7 +3872,7 @@ protected:
 #endif //BACKGROUND_GC
 
     PER_HEAP
-    heap_segment* freeable_large_heap_segment;
+    heap_segment* freeable_ploh_segment;
 
     PER_HEAP_ISOLATED
     heap_segment* segment_standby_list;
