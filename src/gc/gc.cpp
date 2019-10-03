@@ -21,7 +21,7 @@
 
 #define USE_INTROSORT
 
-// We just needed a simple random number generator for testing.
+// We just needed a simple random number generator for testing
 class gc_rand
 {
 public:
