@@ -12723,12 +12723,14 @@ BOOL gc_heap::a_fit_free_list_large_p (size_t size,
 
                 size_t free_list_size = unused_array_size(free_list);
 
+                ptrdiff_t diff = free_list_size - size;
+
 #ifdef FEATURE_LOH_COMPACTION
-                if ((size + loh_pad) <= free_list_size)
-#else
-                if (((size + Align (min_obj_size, align_const)) <= free_list_size)||
-                    (size == free_list_size))
+                diff -= loh_pad;
 #endif //FEATURE_LOH_COMPACTION
+
+                // must fit exactly or leave formattable space
+                if (diff == 0 || diff > (ptrdiff_t)Align (min_obj_size, align_const))
                 {
 #ifdef BACKGROUND_GC
                     cookie = bgc_alloc_lock->loh_alloc_set (free_list);
