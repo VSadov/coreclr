@@ -494,9 +494,15 @@ namespace System.Threading
         [ThreadStatic]
         private static int t_currentProcessorIdCache;
 
+        private const int ProcessorIdApiStateInitial = 0;
+        private const int ProcessorIdApiStateCalibrated = 1;
+        private const int ProcessorIdApiStateDoNotCache = 2;
+
         private const int ProcessorIdCacheShift = 16;
         private const int ProcessorIdCacheCountDownMask = (1 << ProcessorIdCacheShift) - 1;
-        private const int ProcessorIdRefreshRate = 5000;
+
+        private static int s_ProcessorIdRefreshRate = 5000;
+        private static int s_processorIdApiState;
 
         private static int RefreshCurrentProcessorId()
         {
@@ -511,10 +517,10 @@ namespace System.Threading
             // Add offset to make it clear that it is not guaranteed to be 0-based processor number
             currentProcessorId += 100;
 
-            Debug.Assert(ProcessorIdRefreshRate <= ProcessorIdCacheCountDownMask);
+            Debug.Assert(s_ProcessorIdRefreshRate <= ProcessorIdCacheCountDownMask);
 
             // Mask with int.MaxValue to ensure the execution Id is not negative
-            t_currentProcessorIdCache = ((currentProcessorId << ProcessorIdCacheShift) & int.MaxValue) | ProcessorIdRefreshRate;
+            t_currentProcessorIdCache = ((currentProcessorId << ProcessorIdCacheShift) & int.MaxValue) | s_ProcessorIdRefreshRate;
 
             return currentProcessorId;
         }
@@ -529,8 +535,7 @@ namespace System.Threading
 
         // Cached processor id used as a hint for which per-core stack to access. It is periodically
         // refreshed to trail the actual thread core affinity.
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static int GetCurrentProcessorId()
+        private static int GetCurrentProcessorIdCached()
         {
             int currentProcessorIdCache = t_currentProcessorIdCache--;
             if ((currentProcessorIdCache & ProcessorIdCacheCountDownMask) == 0)
@@ -539,6 +544,71 @@ namespace System.Threading
             }
 
             return currentProcessorIdCache >> ProcessorIdCacheShift;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int GetCurrentProcessorId()
+        {
+            if (s_processorIdApiState == ProcessorIdApiStateDoNotCache)
+                return GetCurrentProcessorNumber();
+
+            if (s_processorIdApiState == ProcessorIdApiStateInitial)
+                CalibrateProcessorId();
+
+            return GetCurrentProcessorIdCached();
+        }
+
+        private static void CalibrateProcessorId()
+        {
+            // do not calibrate on multiple threads
+            if (Interlocked.CompareExchange(ref s_processorIdApiState, ProcessorIdApiStateCalibrated, ProcessorIdApiStateInitial) != ProcessorIdApiStateInitial)
+                return;
+
+            // require 1MHz timer. We will be measuring microseconds.
+            if (!Stopwatch.IsHighResolution || Stopwatch.Frequency < 1000000)
+                return;
+
+            Thread currentThread = Threading.Thread.GetCurrentThreadNative();
+            ThreadPriority originalPriority = currentThread.Priority();
+            currentThread.Priority = ThreadPriority.Highest;
+            int gcCount = GC.CollectionCount(0);
+
+            Stopwatch sw = Stopwatch.StartNew();
+
+            // this can take up to 7 usec on extremely slow machine
+            // usually this will be much less.
+            for (int i = 0; i < 1000; i++)
+            {
+                GetCurrentProcessorIdCached();
+            }
+            sw.Stop();
+            long cachedCost = sw.ElapsedTicks;
+
+            // this can take up to 300 usec on a slow machine with bad CoreId implementation
+            // usually this will be much less.
+            sw.Restart();
+            for (int i = 0; i < 1000; i++)
+            {
+                GetCurrentProcessorNumber();
+            }
+            sw.Stop();
+            long unCachedCost = sw.ElapsedTicks;
+            currentThread.Priority = originalPriority;
+
+            if (unCachedCost < cachedCost * 3)
+            {
+                // this is very fast and is not worth caching;
+                s_processorIdApiState = ProcessorIdApiStateDoNotCache;
+                return;
+            }
+
+            if (GC.CollectionCount(0) != gcCount)
+            {
+                s_processorIdApiState = ProcessorIdApiStateInitial;
+                return;
+            }
+
+            s_ProcessorIdRefreshRate = (int)(unCachedCost / cachedCost);
         }
 
         internal void ResetThreadPoolThread()
