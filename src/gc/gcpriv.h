@@ -955,8 +955,8 @@ enum alloc_wait_reason
     // no longer used with the introduction of loh msl.
     awr_loh_alloc_during_plan = 10,
 
-    // we don't allow too much loh allocation during bgc.
-    awr_loh_alloc_during_bgc = 11
+    // we don't allow too much ploh allocation during bgc.
+    awr_ploh_alloc_during_bgc = 11
 };
 
 struct alloc_thread_wait_data
@@ -1514,7 +1514,7 @@ protected:
     void wait_for_bgc_high_memory (alloc_wait_reason awr, bool loh_p);
 
     PER_HEAP
-    void bgc_loh_alloc_clr (uint8_t* alloc_start,
+    void bgc_ploh_alloc_clr (uint8_t* alloc_start,
                             size_t size, 
                             alloc_context* acontext,
                             uint32_t flags, 
@@ -1526,13 +1526,16 @@ protected:
     
 #ifdef BACKGROUND_GC
     PER_HEAP
-    void bgc_track_loh_alloc();
+    void bgc_track_ploh_alloc();
 
     PER_HEAP
-    void bgc_untrack_loh_alloc();
+    void bgc_untrack_ploh_alloc();
 
     PER_HEAP
-    BOOL bgc_loh_should_allocate();
+    BOOL bgc_loh_allocate_spin();
+
+    PER_HEAP
+    BOOL bgc_poh_allocate_spin();
 #endif //BACKGROUND_GC
 
 #define max_saved_spinlock_info 48
@@ -1580,7 +1583,7 @@ protected:
                                   BOOL* commit_failed_p,
                                   oom_reason* oom_r);
     PER_HEAP
-    BOOL ploh_get_new_seg (generation* gen,
+    BOOL ploh_get_new_seg (int gen_number,
                           size_t size,
                           int align_const,
                           BOOL* commit_failed_p,
@@ -1704,11 +1707,11 @@ protected:
     PER_HEAP_ISOLATED
     void seg_mapping_table_remove_segment (heap_segment* seg);
     PER_HEAP
-    heap_segment* get_large_segment (size_t size, BOOL* did_full_compact_gc);
+    heap_segment* get_large_segment (int gen_number, size_t size, BOOL* did_full_compact_gc);
     PER_HEAP
-    void thread_loh_segment (heap_segment* new_seg);
+    void thread_ploh_segment (int gen_number, heap_segment* new_seg);
     PER_HEAP_ISOLATED
-    heap_segment* get_segment_for_loh (size_t size
+    heap_segment* get_segment_for_ploh (int gen_number, size_t size
 #ifdef MULTIPLE_HEAPS
                                       , gc_heap* hp
 #endif //MULTIPLE_HEAPS
@@ -3458,6 +3461,8 @@ protected:
     PER_HEAP
     size_t     bgc_begin_loh_size;
     PER_HEAP
+    size_t     bgc_begin_poh_size;
+    PER_HEAP
     size_t     end_loh_size;
     //TODO: VS used?
     PER_HEAP
@@ -3470,7 +3475,7 @@ protected:
     // ms. So we are already 30% over the original heap size the thread will
     // sleep for 3ms.
     PER_HEAP
-    uint32_t   bgc_alloc_spin_loh;
+    uint32_t   bgc_alloc_spin_ploh;
 
     // This includes what we allocate at the end of segment - allocating
     // in free list doesn't increase the heap size.
@@ -3483,10 +3488,10 @@ protected:
     size_t     background_soh_alloc_count;
 
     PER_HEAP
-    size_t     background_loh_alloc_count;
+    size_t     background_ploh_alloc_count;
 
     PER_HEAP
-    VOLATILE(int32_t) loh_alloc_thread_count;
+    VOLATILE(int32_t) ploh_alloc_thread_count;
 
     PER_HEAP
     uint8_t**  background_mark_stack_tos;
