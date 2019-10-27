@@ -2080,7 +2080,7 @@ protected:
     // there so we mark them as to be deleted and deleted them
     // at the next chance we get.
     PER_HEAP
-    void background_delay_delete_loh_segments();
+    void background_delay_delete_ploh_segments();
     PER_HEAP
     void generation_delete_heap_segment (generation*, 
                                          heap_segment*, heap_segment*, heap_segment*);
@@ -4472,7 +4472,7 @@ struct loh_padding_obj
 #define heap_segment_flags_ma_committed 64
 // for segments whose mark array is only partially committed.
 #define heap_segment_flags_ma_pcommitted 128
-#define heap_segment_flags_loh_delete   256
+#define heap_segment_flags_ploh_delete   256
 
 // TODO: VS reorder, make enum
 #define heap_segment_flags_poh          512
