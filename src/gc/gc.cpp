@@ -8308,7 +8308,7 @@ void gc_heap::copy_brick_card_table()
     // or the card table
     for (int i = max_generation; i <= poh_generation; i++)
     {
-        heap_segment* seg = generation_start_segment(generation_of(max_generation));
+        heap_segment* seg = generation_start_segment(generation_of(i));
         while (seg)
         {
             if (heap_segment_read_only_p (seg) && !heap_segment_in_range_p (seg))
@@ -10487,7 +10487,7 @@ HRESULT gc_heap::initialize_gc (size_t soh_segment_size,
 #ifdef BACKGROUND_GC
     if (can_use_write_watch_for_gc_heap() && GCConfig::GetConcurrentGC())
     {
-        gc_can_use_concurrent = false;
+        gc_can_use_concurrent = true;
 #ifndef FEATURE_USE_SOFTWARE_WRITE_WATCH_FOR_GC_HEAP
         virtual_alloc_hardware_write_watch = true;
 #endif // !FEATURE_USE_SOFTWARE_WRITE_WATCH_FOR_GC_HEAP
@@ -25625,6 +25625,7 @@ void gc_heap::relocate_phase (int condemned_gen_number,
             relocate_in_ploh_objects (loh_generation);
         }
 
+        //TODO: VS once we disallow references in POH, this can be removed.
         relocate_in_ploh_objects (poh_generation);
     }
     {
