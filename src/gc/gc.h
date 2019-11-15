@@ -123,11 +123,8 @@ enum generation_num
     // large object heap, technically not a generation, but it is convenient to represent it as such
     loh_generation = 3,
 
-    // pinned heap, a separate generation for the same reasons as loh
-    poh_generation = 4,
-
     // number of all generations 
-    total_generation_count = poh_generation + 1
+    total_generation_count = loh_generation + 1
 };
 
 #ifdef GC_CONFIG_DRIVEN

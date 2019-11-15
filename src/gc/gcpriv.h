@@ -1237,8 +1237,7 @@ public:
 
     static
     HRESULT initialize_gc  (size_t soh_segment_size,
-                            size_t loh_segment_size,
-                            size_t poh_segment_size
+                            size_t loh_segment_size
 #ifdef MULTIPLE_HEAPS
                             , int number_of_heaps
 #endif //MULTIPLE_HEAPS
@@ -1287,15 +1286,6 @@ public:
     // lowest_address and highest_address, which are currently the same accross all heaps.
     PER_HEAP
     CObjectHeader* allocate_large_object (size_t size, uint32_t flags, int64_t& alloc_bytes);
-
-
-    // For POH allocations we only update the alloc_bytes_ploh in allocation
-    // context - we don't actually use the ptr/limit from it so I am
-    // making this explicit by not passing in the alloc_context.
-    // Note: This is an instance method, but the heap instance is only used for
-    // lowest_address and highest_address, which are currently the same accross all heaps.
-    PER_HEAP
-    CObjectHeader* allocate_pinned_object (size_t size, uint32_t flags, int64_t& alloc_bytes);
 
 #ifdef FEATURE_STRUCTALIGN
     PER_HEAP
@@ -1561,9 +1551,6 @@ protected:
 
     PER_HEAP
     BOOL bgc_loh_allocate_spin();
-
-    PER_HEAP
-    BOOL bgc_poh_allocate_spin();
 #endif //BACKGROUND_GC
 
 #define max_saved_spinlock_info 48
@@ -3752,11 +3739,7 @@ protected:
     PER_HEAP
     size_t     bgc_begin_loh_size;
     PER_HEAP
-    size_t     bgc_begin_poh_size;
-    PER_HEAP
     size_t     end_loh_size;
-    PER_HEAP
-    size_t     end_poh_size;
 
 #ifdef BGC_SERVO_TUNING
     PER_HEAP
@@ -3790,8 +3773,6 @@ protected:
     // in free list doesn't increase the heap size.
     PER_HEAP
     size_t     bgc_loh_size_increased;
-    PER_HEAP
-    size_t     bgc_poh_size_increased;
 
     PER_HEAP
     size_t     background_soh_alloc_count;
@@ -3929,7 +3910,6 @@ protected:
 
 #define youngest_generation (generation_of (0))
 #define large_object_generation (generation_of (loh_generation))
-#define pinned_object_generation (generation_of (poh_generation))
 
     // The more_space_lock and gc_lock is used for 3 purposes:
     //
@@ -4016,15 +3996,6 @@ protected:
 #endif // BIT64
     PER_HEAP
     alloc_list gen2_alloc_list[NUM_GEN2_ALIST-1];
-
-#define NUM_POH_ALIST (12)
-#ifdef BIT64
-#define BASE_POH_ALIST (1*256)
-#else
-#define BASE_POH_ALIST (1*128)
-#endif // BIT64
-    PER_HEAP
-    alloc_list poh_alloc_list[NUM_POH_ALIST-1];
 
 //------------------------------------------    
 
@@ -4316,9 +4287,6 @@ public:
     VOLATILE(uint32_t)    card_mark_chunk_index_loh;
 
     PER_HEAP
-    VOLATILE(uint32_t)    card_mark_chunk_index_poh;
-
-    PER_HEAP
     VOLATILE(bool)        card_mark_done_ploh;
 
     PER_HEAP
@@ -4329,7 +4297,6 @@ public:
         card_mark_done_soh = false;
 
         card_mark_chunk_index_loh = ~0;
-        card_mark_chunk_index_poh = ~0;
         card_mark_done_ploh = false;
     }
 
@@ -4820,7 +4787,6 @@ struct loh_padding_obj
 #define heap_segment_flags_ma_pcommitted 128
 #define heap_segment_flags_ploh_delete   256
 
-#define heap_segment_flags_poh          512
 #endif //BACKGROUND_GC
 
 //need to be careful to keep enough pad items to fit a relocation node
@@ -4909,7 +4875,7 @@ BOOL heap_segment_unmappable_p (heap_segment* inst)
 inline
 BOOL heap_segment_ploh_p (heap_segment * inst)
 {
-    return !!(inst->flags & (heap_segment_flags_loh | heap_segment_flags_poh));
+    return !!(inst->flags & (heap_segment_flags_loh));
 }
 
 #ifdef BACKGROUND_GC

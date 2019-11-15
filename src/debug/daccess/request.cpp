@@ -708,8 +708,6 @@ ClrDataAccess::GetThreadAllocData(CLRDATA_ADDRESS addr, struct DacpAllocData *da
     Thread* thread = PTR_Thread(TO_TADDR(addr));
 
     data->allocBytes = TO_CDADDR(thread->m_alloc_context.alloc_bytes);
-
-    // POH allocations are always via API and do not get recorded on the thread's context.
     data->allocBytesLoh = TO_CDADDR(thread->m_alloc_context.alloc_bytes_ploh);
 
     SOSDacLeave();
