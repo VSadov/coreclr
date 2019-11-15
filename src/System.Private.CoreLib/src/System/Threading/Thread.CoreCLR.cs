@@ -487,12 +487,20 @@ namespace System.Threading
         [MethodImpl(MethodImplOptions.InternalCall)]
         private static extern int GetCurrentProcessorNumber();
 
-        // The upper bits of t_currentProcessorIdCache are the currentProcessorId. The lower bits of
-        // the t_currentProcessorIdCache are counting down to get it periodically refreshed.
-        // TODO: Consider flushing the currentProcessorIdCache on Wait operations or similar
-        // actions that are likely to result in changing the executing core
-        [ThreadStatic]
-        private static int t_currentProcessorIdCache;
+        //[DllImport(Interop.Libraries.Kernel32, ExactSpelling = true)]
+        //[SuppressGCTransition]
+        //private static extern int GetCurrentProcessorNumber();
+
+        // t_currentProcessorId is in a separate class to make sure the class is fully initialized by the time we use it
+        private class CoreIdCache
+        {
+            // The upper bits of t_currentProcessorId are the currentProcessorId. The lower bits of
+            // the t_currentProcessorIdCache are counting down to get it periodically refreshed.
+            // TODO: Consider flushing the currentProcessorIdCache on Wait operations or similar
+            // actions that are likely to result in changing the executing core
+            [ThreadStatic]
+            internal static int t_currentProcessorId;
+        }
 
         private const int ProcessorIdCacheShift = 16;
         private const int ProcessorIdCacheCountDownMask = (1 << ProcessorIdCacheShift) - 1;
@@ -519,7 +527,7 @@ namespace System.Threading
             Debug.Assert(ProcessorIdRefreshRate <= ProcessorIdCacheCountDownMask);
 
             // Mask with int.MaxValue to ensure the execution Id is not negative
-            t_currentProcessorIdCache = ((currentProcessorId << ProcessorIdCacheShift) & int.MaxValue) | ProcessorIdRefreshRate;
+            CoreIdCache.t_currentProcessorId = ((currentProcessorId << ProcessorIdCacheShift) & int.MaxValue) | ProcessorIdRefreshRate;
 
             return currentProcessorId;
         }
@@ -529,10 +537,10 @@ namespace System.Threading
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static int GetCurrentProcessorId()
         {
-            if (IsCoreIdReallyFast || ProcessorIdRefreshRate < 2)
+            if (IsCoreIdReallyFast || ProcessorIdRefreshRate <= 2)
                 return GetCurrentProcessorNumber();
 
-            int currentProcessorIdCache = t_currentProcessorIdCache--;
+            int currentProcessorIdCache = CoreIdCache.t_currentProcessorId--;
             if ((currentProcessorIdCache & ProcessorIdCacheCountDownMask) == 0)
             {
                 return RefreshCurrentProcessorId();
@@ -549,63 +557,70 @@ namespace System.Threading
         // Check more than once - to make sure it was not because TLS was delayed by GC or a context switch.
         private static bool SimpleCoreIdSpeedCheck()
         {
-            // if we ever run with low resolution timer, don't bother
-            if (!Stopwatch.IsHighResolution)
-                return false;
-
             // warm up the code paths.
-            int accumulator = UninlinedTLSAccess() | GetCurrentProcessorNumber();
+            int id = UninlinedTLSAccess() | GetCurrentProcessorNumber();
+            long _05usec = Stopwatch.Frequency / 1000000;
 
-            // limit total measuring to 100 microseconds for a possible, but very unlikely "slow positive case"
+            // limit quick test to 100 microseconds.
+            // If we are on slow hardware, we should calibrate anyways.
             long limit = Stopwatch.Frequency / 10000 + Stopwatch.GetTimestamp();
-
-            for (int i = 0; i < 100; i++)
+            for (int i = 0; i < 10; i++)
             {
-                long t1 = Stopwatch.GetTimestamp();
-                accumulator |= UninlinedTLSAccess();
-                accumulator |= UninlinedTLSAccess();
+                int iters = 1;
+                long t1 = 0;
+                // double the sample size until it is 0.5 usec.
+                while (t1 < _05usec)
+                {
+                    iters *= 2;
+                    t1 = Stopwatch.GetTimestamp();
+                    for (int j = 0; j < iters; j++)
+                    {
+                        id = GetCurrentProcessorNumber();
+                    }
+                    t1 = Stopwatch.GetTimestamp() - t1;
+                }
+
+                // assuming TLS cannot be a lot slower than getting ID, this should take 1-5 usec
                 long t2 = Stopwatch.GetTimestamp();
-                accumulator |= GetCurrentProcessorNumber();
+                for (int j = 0; j < iters; j++)
+                {
+                    UninlinedTLSAccess();
+                }
                 long t3 = Stopwatch.GetTimestamp();
 
-                // if getting ID takes longer than 2x TLS access, we may be better with caching.
-                Internal.Console.WriteLine($"t1: {t1}, t2: {t2}, t3:{t3}.");
-
-                if (t3 > limit || (t2 - t1) <= (t3 - t2))
+                // if getting ID took longer than 2x TLS access, we should consider caching.
+                if (t3 > limit || (t3 - t2) * 2 < t1)
                 {
                     return false;
                 }
             }
 
-            // Make sure the result was never negative, which would indicate "Not Supported"
+            // Make sure the result was not negative, which would indicate "Not Supported"
             Internal.Console.WriteLine("CoreId is very fast. No caching.");
-            return accumulator >= 0;
+            return id >= 0;
         }
 
         // NoInlining is to make sure JIT does not CSE the access and to have a better perf proxy.
-        // The actual use would not be reading this in a loop as we do.
+        // The actual use would not be reading processor ID in a loop as we do.
         [MethodImpl(MethodImplOptions.NoInlining)]
         private static int UninlinedTLSAccess()
         {
-            return t_currentProcessorIdCache;
+            return CoreIdCache.t_currentProcessorId;
         }
 
         // We must collect multiple samples to account for irregularities caused by GC and context switches.
-        //
         // Why we keep an array of samples and do not adjust as we go:
         //   We expect that we will adjust the refresh rate down. If we do that early, we may end up forcing all
         //   the calibration work to happen much sooner. There is no urgency in being calibrated while the app
         //   is in start-up mode. We would just add to the "rush hour" traffic.
-        //   Let's collect samples at predefined pace, and then adjust.
-        // 25 is picked to budget the sampling under 100 msec total, assuming 4 msec per sample.
-        private const int CalibrationSamples = 25;
-        private static double[] sCalibrationSamples = new double[CalibrationSamples * 2];
         private static int sCalibrationToDo;
         private static int sCalibrationDone;
+        // 25 is chosen to budget the sampling under 100 msec total, assuming 4 msec per sample.
+        private const int CalibrationSamples = 25;
+        private static double[] sCalibrationSamples = new double[CalibrationSamples * 2];
 
         private static void CalibrateOnce()
         {
-            // is there work?
             if (sCalibrationToDo >= CalibrationSamples)
                 return;
 
@@ -613,42 +628,39 @@ namespace System.Threading
             if (sample >= CalibrationSamples)
                 return;
 
-            // Actual calibration step.
-            // let's try to fit into 4 msec or so.
+            // Actual calibration step. Let's try to fit into ~4 msec.
             double[] calibrationState = sCalibrationSamples;
 
             int id = 0;
             long t1 = 0;
-            long t2 = 0;
-            long msec = Stopwatch.Frequency / 1000;
+            long _1msec = Stopwatch.Frequency / 1000;
             int iters = 1;
 
             // double the sample size until it is 1 msec.
-            // may spend up to 3 msec here total in a worst case.
-            // limit the number of iterations to some large value - just in case the clock is really bad
-            while (t2 - t1 < msec && iters < short.MaxValue)
+            // we may spend up to 3 msec in this loop in a worst case.
+            while (t1 < _1msec)
             {
                 iters *= 2;
-
                 t1 = Stopwatch.GetTimestamp();
                 for (int i = 0; i < iters; i++)
                 {
-                    id |= GetCurrentProcessorNumber();
+                    id = GetCurrentProcessorNumber();
                 }
-                t2 = Stopwatch.GetTimestamp();
+                t1 = Stopwatch.GetTimestamp() - t1;
             }
 
             // assuming TLS cannot be a lot slower than ID, this should take 1 msec
+            long t2 = Stopwatch.GetTimestamp();
             for (int i = 0; i < iters; i++)
             {
-                id |= UninlinedTLSAccess();
+                UninlinedTLSAccess();
             }
             long t3 = Stopwatch.GetTimestamp();
 
             // if we have useful measurements, record a sample
-            if (id >= 0 && t2 - t1 > 0 && t3 - t2 > 0)
+            if (id >= 0 && t1 > 0 && t3 - t2 > 0)
             {
-                calibrationState[sample * 2] = (double)(t2 - t1) / iters;     // ID
+                calibrationState[sample * 2] = (double)t1 / iters;            // ID
                 calibrationState[sample * 2 + 1] = (double)(t3 - t2) / iters; // TLS
             }
             else
@@ -658,6 +670,8 @@ namespace System.Threading
                 calibrationState[sample * 2] = (double)Stopwatch.Frequency * 50; // 50 sec;
                 calibrationState[sample * 2 + 1] = Stopwatch.Frequency; // 1 sec
             }
+
+            // Internal.Console.WriteLine($"sample: {calibrationState[sample * 2]}, {calibrationState[sample * 2 + 1]}, iters: {iters}");
 
             // If this was the last sample computed, get best times and update the ratio of ID to TLS.
             if (Interlocked.Increment(ref sCalibrationDone) == CalibrationSamples)
