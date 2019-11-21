@@ -3541,9 +3541,9 @@ public:
     PER_HEAP
     BOOL ephemeral_promotion;
     PER_HEAP
-    uint8_t* saved_ephemeral_plan_start[soh_generation_count];
+    uint8_t* saved_ephemeral_plan_start[ephemeral_generation_count];
     PER_HEAP
-    size_t saved_ephemeral_plan_start_size[soh_generation_count];
+    size_t saved_ephemeral_plan_start_size[ephemeral_generation_count];
 
 protected:
 #ifdef MULTIPLE_HEAPS

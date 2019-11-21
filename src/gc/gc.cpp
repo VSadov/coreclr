@@ -2679,8 +2679,8 @@ uint8_t*    gc_heap::highest_address;
 
 BOOL        gc_heap::ephemeral_promotion;
 
-uint8_t*    gc_heap::saved_ephemeral_plan_start[soh_generation_count];
-size_t      gc_heap::saved_ephemeral_plan_start_size[soh_generation_count];
+uint8_t*    gc_heap::saved_ephemeral_plan_start[ephemeral_generation_count];
+size_t      gc_heap::saved_ephemeral_plan_start_size[ephemeral_generation_count];
 
 short*      gc_heap::brick_table;
 
@@ -4401,10 +4401,10 @@ BOOL reserve_initial_memory (size_t normal_size, size_t large_size, int num_heap
     assert (memory_details.initial_memory == 0);
 
     // soh + loh segments * num_heaps  
-    memory_details.initial_memory = new (nothrow) imemory_data[num_heaps * 3]; //TODO: TODO 3 -> some_gen_num
+    memory_details.initial_memory = new (nothrow) imemory_data[num_heaps * (total_generation_count - ephemeral_generation_count)];
     if (memory_details.initial_memory == 0)
     {
-        dprintf (2, ("failed to reserve %Id bytes for imemory_data", num_heaps * 2 * sizeof (imemory_data))); //TODO: TODO 3
+        dprintf (2, ("failed to reserve %Id bytes for imemory_data", num_heaps * (total_generation_count - ephemeral_generation_count) * sizeof (imemory_data)));
         return FALSE;
     }
 
@@ -4489,7 +4489,7 @@ BOOL reserve_initial_memory (size_t normal_size, size_t large_size, int num_heap
             memory_details.allocation_pattern = initial_memory_details::EACH_BLOCK;
 
             imemory_data* current_block = memory_details.initial_memory;
-            for (int i = 0; i < (memory_details.block_count * 2); i++, current_block++)  //TODO: TODO 3
+            for (int i = 0; i < (memory_details.block_count * (total_generation_count - ephemeral_generation_count)); i++, current_block++)
             {
                 size_t block_size = memory_details.block_size(i);
                 current_block->memory_base =
@@ -4751,7 +4751,7 @@ gc_heap::soh_get_segment_to_expand()
 #endif //BACKGROUND_GC
         )
     {
-        assert(settings.condemned_generation < soh_generation_count);
+        assert(settings.condemned_generation <= max_generation);
         allocator*  gen_alloc = ((settings.condemned_generation == max_generation) ? nullptr :
                               generation_allocator (generation_of (max_generation)));
         dprintf (2, ("(gen%d)soh_get_segment_to_expand", settings.condemned_generation));

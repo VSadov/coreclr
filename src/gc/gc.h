@@ -115,13 +115,13 @@ enum generation_num
     soh_gen0 = 0,
     soh_gen1 = 1,
     soh_gen2 = 2,
-
     max_generation = soh_gen2,
-
-    soh_generation_count = soh_gen2 + 1,
 
     // large object heap, technically not a generation, but it is convenient to represent it as such
     loh_generation = 3,
+
+    // number of ephemeral generations 
+    ephemeral_generation_count = max_generation,
 
     // number of all generations 
     total_generation_count = loh_generation + 1
