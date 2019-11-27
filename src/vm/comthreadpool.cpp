@@ -476,32 +476,19 @@ VOID QueueUserWorkItemManagedCallback(PVOID pArg)
 }
 
 
-BOOL QCALLTYPE ThreadPoolNative::RequestWorkerThread()
+FCIMPL0(FC_BOOL_RET, ThreadPoolNative::RequestWorkerThread)
 {
-    QCALL_CONTRACT;
+    FCALL_CONTRACT;
 
-    BOOL res = FALSE;
-
-    BEGIN_QCALL;
+    HELPER_METHOD_FRAME_BEGIN_RET_0();
+    _ASSERTE(ThreadpoolMgr::IsInitialized());
 
     ThreadpoolMgr::SetAppDomainRequestsActive();
+    HELPER_METHOD_FRAME_END()
 
-    res = ThreadpoolMgr::QueueUserWorkItem(NULL,
-                                           NULL,
-                                           0,
-                                           FALSE);
-    if (!res)
-    {
-        if (GetLastError() == ERROR_CALL_NOT_IMPLEMENTED)
-            COMPlusThrow(kNotSupportedException);
-        else
-            COMPlusThrowWin32();
-    }
-
-    END_QCALL;
-    return res;
+    FC_RETURN_BOOL(TRUE);
 }
-
+FCIMPLEND
 
 /********************************************************************************************************************/
 

@@ -297,7 +297,7 @@ namespace System.Threading
             return registeredWaitHandle;
         }
 
-        [DllImport(RuntimeHelpers.QCall, CharSet = CharSet.Unicode)]
+        [MethodImpl(MethodImplOptions.InternalCall)]
         internal static extern Interop.BOOL RequestWorkerThread();
 
         [MethodImpl(MethodImplOptions.InternalCall)]

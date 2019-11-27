@@ -47,8 +47,7 @@ public:
                                 CLR_BOOL executeOnlyOnce,
                                 Object* registeredWaitObjectUNSAFE);
 
-    static BOOL QCALLTYPE RequestWorkerThread();
-
+    static FCDECL0(FC_BOOL_RET, RequestWorkerThread);
     static FCDECL1(FC_BOOL_RET, CorPostQueuedCompletionStatus, LPOVERLAPPED lpOverlapped);
     static FCDECL2(FC_BOOL_RET, CorUnregisterWait, LPVOID WaitHandle, Object * objectToNotify);
     static FCDECL1(void, CorWaitHandleCleanupNative, LPVOID WaitHandle);

@@ -675,7 +675,7 @@ FCFuncStart(gThreadPoolFuncs)
     FCFuncElement("NotifyWorkItemProgressNative", ThreadPoolNative::NotifyRequestProgress)
     QCFuncElement("InitializeVMTp", ThreadPoolNative::InitializeVMTp)
     FCFuncElement("ReportThreadStatus", ThreadPoolNative::ReportThreadStatus)
-    QCFuncElement("RequestWorkerThread", ThreadPoolNative::RequestWorkerThread)
+    FCFuncElement("RequestWorkerThread", ThreadPoolNative::RequestWorkerThread)
 FCFuncEnd()
 
 FCFuncStart(gTimerFuncs)
