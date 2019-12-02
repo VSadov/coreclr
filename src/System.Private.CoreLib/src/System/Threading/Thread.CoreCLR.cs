@@ -496,7 +496,7 @@ namespace System.Threading
 
         private const int ProcessorIdCacheShift = 16;
         private const int ProcessorIdCacheCountDownMask = (1 << ProcessorIdCacheShift) - 1;
-        private const int ProcessorIdRefreshRate = 5000;
+        private const int ProcessorIdRefreshRate = 5;
 
         private static int RefreshCurrentProcessorId()
         {
