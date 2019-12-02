@@ -359,7 +359,7 @@ namespace System.Threading
                 internal object? TryDequeue(LocalQueue lQueue)
                 {
                     // Loop in case of contention...
-                    var spinner = new SpinWait();
+                    SpinWait spinner = default;
                     int delay = lQueue._coreContext.LastGlobalDequeueDelay >> 1;
 
                     for (; ; )
@@ -793,11 +793,6 @@ namespace System.Threading
                 /// </summary>
                 private const int Change = 2;
 
-                /// <summary>
-                /// When a segment has more than this, we steal half of its slots.
-                /// </summary>
-                private const int RichCount = 32;
-
                 /// <summary>Creates the segment.</summary>
                 /// <param name="length">
                 /// The maximum number of elements the segment can contain.  Must be a power of 2.
@@ -878,7 +873,6 @@ namespace System.Threading
                     }
                 }
 
-                // for debugging
                 internal int Count => _queueEnds.Enqueue - _queueEnds.Dequeue;
 
                 internal object? TryPop()
@@ -975,11 +969,9 @@ namespace System.Threading
                             {
                                 object? item;
                                 var enqPos = _queueEnds.Enqueue;
-
-                                if (enqPos - position < RichCount ||
-                                    // take from the rich and give to the needy!!
-                                    // NB: "this" is a sentinel for a failed robbing attempt
-                                    (item = TryRob(position, enqPos)) == this)
+                                if (enqPos - position < RobThreshold ||
+                                    // "this" is a sentinel for a failed robbing attempt
+                                    (item = TryRobCore(ThreadPoolGlobals.workQueue.GetOrAddLocalQueue()._enqSegment, position, enqPos)) == this)
                                 {
                                     _queueEnds.Dequeue = position + 1;
                                     item = slot.Item;
@@ -1029,11 +1021,44 @@ namespace System.Threading
                     }
                 }
 
-                internal object? TryRob(int deqPosition, int enqPosition)
+                internal object? TryRobTo(LocalQueueSegment other)
                 {
-                    LocalQueueSegment other = ThreadPoolGlobals.workQueue.GetOrAddLocalQueue()._enqSegment;
-                    if (this != other)
+                    int deqPos = _queueEnds.Dequeue;
+                    ref Slot slot = ref this[deqPos];
+                    int sequenceNumber = slot.SequenceNumber;
+
+                    // Check if the slot is considered Full in the current generation.
+                    int diff = sequenceNumber - deqPos;
+                    if (diff == Full)
                     {
+                        // Reserve the slot for Dequeuing.
+                        if (Interlocked.CompareExchange(ref slot.SequenceNumber, deqPos + Change, sequenceNumber) == sequenceNumber)
+                        {
+                            var enqPos = _queueEnds.Enqueue;
+                            object? item = TryRobCore(other, deqPos, enqPos);
+
+                            // "this" is a sentinel for a failed robbing attempt
+                            if (item == this)
+                            {
+                                // steal one item anyways then, since we can.
+                                _queueEnds.Dequeue = deqPos + 1;
+                                item = slot.Item;
+                                slot.Item = null;
+                            }
+
+                            // unlock the slot for enqueuing by making the slot empty in the next generation
+                            Volatile.Write(ref slot.SequenceNumber, deqPos + 1 + _slotsMask);
+                            return item;
+                        }
+                    }
+
+                    return null;
+                }
+
+                internal object? TryRobCore(LocalQueueSegment other, int deqPosition, int enqPosition)
+                {
+                    Debug.Assert(this != other);
+
                         // same stanza as in TryEnqueue
                         int otherEnqPosition = other._queueEnds.Enqueue;
                         ref Slot enqPrevSlot = ref other[otherEnqPosition - 1];
@@ -1045,88 +1070,87 @@ namespace System.Threading
                         int halfPosition = deqPosition + count / 2;
                         ref Slot halfSlot = ref this[halfPosition];
 
-                        // unlike Enqueue, we require prev slot be empty
-                        // not just to prevent rich getting richer
-                        // we also do not want a possibility that the same segment is both robbed from and robbed to, which would be messy
-                        if (prevSequenceNumber == otherEnqPosition + other._slotsMask)
+                    // unlike Enqueue, we require prev slot be empty
+                    // not just to prevent rich getting richer
+                    // we also do not want a possibility that the same segment is both robbed from and robbed to, which would be messy
+                    if (prevSequenceNumber == otherEnqPosition + other._slotsMask)
+                    {
+                        // lock the other segment for enqueuing
+                        if (Interlocked.CompareExchange(ref enqPrevSlot.SequenceNumber, prevSequenceNumber + Change, prevSequenceNumber) == prevSequenceNumber)
                         {
-                            // lock the other segment for enqueuing
-                            if (Interlocked.CompareExchange(ref enqPrevSlot.SequenceNumber, prevSequenceNumber + Change, prevSequenceNumber) == prevSequenceNumber)
+                            // confirm that enqueue did not change while we were locking the slot
+                            // it is extremely rare, but we may see another Pop or Enqueue on the same segment.
+                            if (other._queueEnds.Enqueue == otherEnqPosition)
                             {
-                                // confirm that enqueue did not change while we were locking the slot
-                                // it is extremely rare, but we may see another Pop or Enqueue on the same segment.
-                                if (other._queueEnds.Enqueue == otherEnqPosition)
+                                // lock halfslot, it must be full
+                                if (Interlocked.CompareExchange(ref halfSlot.SequenceNumber, halfPosition + Change, halfPosition + Full) == halfPosition + Full)
                                 {
-                                    // lock halfslot, it must be full
-                                    if (Interlocked.CompareExchange(ref halfSlot.SequenceNumber, halfPosition + Change, halfPosition + Full) == halfPosition + Full)
+                                    // our enqueue could have changed before we locked half
+                                    // make sure that half-way slot is still before enqueue
+                                    // in fact give it more space - we do not want to rob all the items, especially if someone else popping them fast.
+                                    var enq = deqPosition + ((_queueEnds.Enqueue - deqPosition) & _slotsMask);
+                                    if (enq - halfPosition > (RobThreshold / 4))
                                     {
-                                        // our enqueue could have changed before we locked half
-                                        // make sure that half-way slot is still before enqueue
-                                        // in fact give it more space - we do not want to rob all the items, especially if someone else popping them fast.
-                                        var enq = deqPosition + ((_queueEnds.Enqueue - deqPosition) & _slotsMask);
-                                        if (enq - halfPosition > (RichCount / 4))
+                                        int i = deqPosition, j = otherEnqPosition;
+                                        ref Slot last = ref this[i++];
+
+                                        while (true)
                                         {
-                                            int i = deqPosition, j = otherEnqPosition;
-                                            ref Slot last = ref this[i++];
+                                            ref Slot next = ref this[i];
+                                            ref Slot to = ref other[j];
 
-                                            while (true)
+                                            // the other slot must be empty
+                                            // next slot must be full
+                                            if (to.SequenceNumber != j | next.SequenceNumber != i + Full)
                                             {
-                                                ref Slot next = ref this[i];
-                                                ref Slot to = ref other[j];
-
-                                                // the other slot must be empty
-                                                // next slot must be full
-                                                if (to.SequenceNumber != j | next.SequenceNumber != i + Full)
-                                                {
-                                                    break;
-                                                }
-
-                                                to.Item = last.Item;
-                                                // NB: enables "to" for dequeuing, which may immediately happen,
-                                                // but not for popping, yet - since the other enq is locked
-                                                Volatile.Write(ref to.SequenceNumber, j + Full);
-
-                                                last.Item = null;
-
-                                                // we are going to take from next, mark it empty already
-                                                next.SequenceNumber = i + 1 + srcSlotsMask;
-                                                last = ref next;
-
-                                                i++;
-                                                j++;
+                                                break;
                                             }
 
-                                            // return the last slot value
-                                            // (it should already be marked empty, or will be, if it is at deqPosition)
-                                            var result = last.Item;
+                                            to.Item = last.Item;
+                                            // NB: enables "to" for dequeuing, which may immediately happen,
+                                            // but not for popping, yet - since the other enq is locked
+                                            Volatile.Write(ref to.SequenceNumber, j + Full);
+
                                             last.Item = null;
 
-                                            // restore the half slot, must be after all the full->empty slot transitioning
-                                            // to make sure that poppers cannot see robbed slots as still incorrectly full when moving to the left of half.
-                                            Volatile.Write(ref halfSlot.SequenceNumber, halfPosition + Full);
+                                            // we are going to take from next, mark it empty already
+                                            next.SequenceNumber = i + 1 + srcSlotsMask;
+                                            last = ref next;
 
-                                            // advance the other enq, must be done before unlocking other prev slot, or someone could pop prev once unlocked.
-                                            // enables enq/pop
-                                            other._queueEnds.Enqueue = j;
-
-                                            // advance Dequeue, must be after halfSlot is restored - someone could immediately start robbing.
-                                            Volatile.Write(ref _queueEnds.Dequeue, i);
-
-                                            // unlock other prev slot
-                                            // must be after we moved other enq to the next slot, or someone may pop prev and break continuity of full slots.
-                                            enqPrevSlot.SequenceNumber = prevSequenceNumber;
-                                            return result;
+                                            i++;
+                                            j++;
                                         }
 
-                                        // failed to lock the half-way slot.
-                                        // restore via CAS, in case target slot has been robbed to
-                                        Interlocked.CompareExchange(ref halfSlot.SequenceNumber, halfPosition + Full, halfPosition + Change);
-                                    }
-                                }
+                                        // return the last slot value
+                                        // (it should already be marked empty, or will be, if it is at deqPosition)
+                                        var result = last.Item;
+                                        last.Item = null;
 
-                                // failed to lock actual enqueue end, restore with CAS, in case target slot has been robbed to/from
-                                Interlocked.CompareExchange(ref enqPrevSlot.SequenceNumber, prevSequenceNumber, prevSequenceNumber + Change);
+                                        // restore the half slot, must be after all the full->empty slot transitioning
+                                        // to make sure that poppers cannot see robbed slots as still incorrectly full when moving to the left of half.
+                                        Volatile.Write(ref halfSlot.SequenceNumber, halfPosition + Full);
+
+                                        // advance the other enq, must be done before unlocking other prev slot, or someone could pop prev once unlocked.
+                                        // enables enq/pop
+                                        other._queueEnds.Enqueue = j;
+
+                                        // advance Dequeue, must be after halfSlot is restored - someone could immediately start robbing.
+                                        Volatile.Write(ref _queueEnds.Dequeue, i);
+
+                                        // unlock other prev slot
+                                        // must be after we moved other enq to the next slot, or someone may pop prev and break continuity of full slots.
+                                        enqPrevSlot.SequenceNumber = prevSequenceNumber;
+                                        return result;
+                                    }
+
+                                    // failed to lock the half-way slot.
+                                    // restore via CAS, in case target slot has been robbed to
+                                    Interlocked.CompareExchange(ref halfSlot.SequenceNumber, halfPosition + Full, halfPosition + Change);
+                                }
                             }
+
+                            // failed to lock actual enqueue end, restore with CAS, in case target slot has been robbed to/from
+                            Interlocked.CompareExchange(ref enqPrevSlot.SequenceNumber, prevSequenceNumber, prevSequenceNumber + Change);
                         }
                     }
 
@@ -1353,7 +1377,7 @@ namespace System.Threading
             // make sure there is at least one worker request
             // as long as there is one worker to come, this item will be noticed.
             // in fact ask anyways, up to #proc
-            RequestThread();
+            EnsureThreadRequested();
         }
 
         /// <summary>
@@ -1393,19 +1417,43 @@ namespace System.Threading
             return false;
         }
 
+        /// <summary>
+        /// When a segment has more than this, we steal half of its slots.
+        /// </summary>
+        internal const int RobThreshold = 32;
+
         public object? DequeueAny(ref bool missedSteal, LocalQueue localQueue)
         {
+            LocalQueue[] queues = _localQueues;
+
+            // Try robbing a random queue.
+            // It would be preferable over fetching a global item.
+            // We will try only once though. "Count" is relatively expensive (touches queue ends - nearly cetain cache misses).
+            int r = localQueue.NextRnd() & (queues.Length - 1);
+            var otherSegment = queues[r]?._deqSegment;
+            var localSegment = localQueue._enqSegment;
+            if (otherSegment != localSegment && otherSegment != null && otherSegment.Count > RobThreshold)
+            {
+                object? c = otherSegment.TryRobTo(localSegment);
+                if (c != null)
+                {
+                    return c;
+                }
+            }
+
+            // check for local queues that are behind and help by stealing half their items.
+            // we traverse local queues starting with those that differ in lower bits and going gradually up.
+            // this way we want to minimize the chances that two threads concurrently go through the same sequence of queues.
             object? callback = _globalQueue.Dequeue(localQueue);
+
             if (callback == null)
             {
-                LocalQueue[] queues = _localQueues;
-                int localQueueIndex = localQueue.NextRnd() & (_localQueues.Length - 1);
+                int startIndex = localQueue.NextRnd() & (queues.Length - 1);
 
-                // then traverse all local queues starting with those that differ in lower bits and going gradually up.
-                // this way we want to minimize the chances that two threads concurrently go through the same sequence of queues.
+                // do a reliable sweep of all local queues.
                 for (int i = 0; i < queues.Length; i++)
                 {
-                    var localWsq = queues[localQueueIndex ^ i];
+                    var localWsq = queues[startIndex ^ i];
                     callback = localWsq?.Dequeue(ref missedSteal);
                     if (callback != null)
                     {
@@ -1434,6 +1482,12 @@ namespace System.Threading
         }
 
         public long GlobalCount => ThreadPoolGlobals.workQueue._globalQueue.Count;
+
+        // a few self-replicating tasks can dominate LIFO queues while exhibiting near perfect throughput
+        // that is, however, not good for latency of global tasks or local tasks "stuck" under replicators.
+        // we will "donate" a bottom task to the global queue once per DonatingRate operations to limit
+        // such behavior.
+        private const int DonatingRate = 1023;
 
         /// <summary>
         /// Dispatches work items to this thread.
@@ -1488,6 +1542,9 @@ namespace System.Threading
             //
             bool keepThreadSpinning = true;
 
+            // for retries in a case of heavy contention while stealing.
+            SpinWait spinner = default;
+
             try
             {
                 Thread currentThread = Thread.CurrentThread;
@@ -1511,28 +1568,26 @@ namespace System.Threading
 
                     if (workItem == null)
                     {
-                        var spinner = new SpinWait();
-                        for (; ; )
+                        // we could not pop, try stealing
+                        bool missedSteal = false;
+                        workItem = workQueue.DequeueAny(ref missedSteal, localQueue);
+                        if (workItem == null)
                         {
-                            // we could not pop, try stealing
-                            bool missedSteal = false;
-                            workItem = workQueue.DequeueAny(ref missedSteal, localQueue);
-                            if (workItem != null)
-                            {
-                                break;
-                            }
-
-                            // if there is no more work, start reducing parallelism exponentially
-                            if (!missedSteal && (localQueue.NextRnd() & 1) == 0)
+                            // if there is no more work, leave
+                            if (!missedSteal)
                             {
                                 keepThreadSpinning = false;
                                 // Tell the VM we're returning normally, not because Hill Climbing asked us to return.
                                 return true;
                             }
 
-                            // so back off a little and try again (as long as quantum has not expired)
+                            // back off a little and try again (as long as quantum has not expired)
                             spinner.SpinOnce();
+                            continue;
                         }
+
+                        // adjust spin time, in case we will need to spin again
+                        spinner.Count = Math.Max(0, spinner.Count - 1);
                     }
 
                     if (workQueue.loggingEnabled)
@@ -1616,6 +1671,11 @@ namespace System.Threading
                         // as happening often enough to cap the effects of "neglect" while also being cheap
                         // even when compared to nearly no-op tasks.
                         Thread.FlushCurrentProcessorId();
+
+                        if ((tasksDispatched & DonatingRate) == 0)
+                        {
+                            DonateOneItem(localQueue);
+                        }
                     }
                 }
                 while (ThreadPool.KeepDispatching(quantumStartTime));
@@ -1630,11 +1690,33 @@ namespace System.Threading
                 // Make a request for a thread (up to #proc) to account for our leaving.
                 //
                 if (keepThreadSpinning)
+                {
+                    DonationCheck();
                     ThreadPoolGlobals.workQueue.KeepThread();
+                }
 
                 // we are releasing unneeded thread back to VM or the thread has run for a full quantum.
                 // in either case it makes sense to flush the cached core Id.
                 Thread.FlushCurrentProcessorId();
+            }
+        }
+
+        private static void DonationCheck()
+        {
+            var localQueue = ThreadPoolGlobals.workQueue.GetOrAddLocalQueue();
+            if ((localQueue.NextRnd() & DonatingRate) == 0)
+            {
+                DonateOneItem(localQueue);
+            }
+        }
+
+        private static void DonateOneItem(LocalQueue localQueue)
+        {
+            bool dummy = true;
+            var item = localQueue.Dequeue(ref dummy);
+            if (item != null)
+            {
+                ThreadPoolGlobals.workQueue._globalQueue.Enqueue(item, localQueue);
             }
         }
     }
