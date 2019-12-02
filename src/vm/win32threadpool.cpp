@@ -1036,13 +1036,13 @@ void ThreadpoolMgr::MaybeAddWorkingWorker()
     _ASSERTE(toRelease >= 0);
     _ASSERTE(toUnretire + toCreate + toRelease <= 1);
 
+    if (toRelease > 0)
+        WorkerSemaphore->Release(toRelease);
+
     if (toUnretire > 0)
     {
         RetiredWorkerSemaphore->Release(toUnretire);
     }
-
-    if (toRelease > 0)
-        WorkerSemaphore->Release(toRelease);
 
     while (toCreate > 0)
     {
@@ -1897,8 +1897,7 @@ DWORD WINAPI ThreadpoolMgr::WorkerThreadStart(LPVOID lpArgs)
     DWORD dwSwitchCount = 0;
     BOOL fThreadInit = FALSE;
 
-    ThreadCounter::Counts counts, oldCounts, newCounts;
-    bool foundWork = true, wasNotRecalled = true;
+    ThreadCounter::Counts counts, oldCounts, newCounts;  
 
     counts = WorkerCounter.GetCleanCounts();
     if (ETW_EVENT_ENABLED(MICROSOFT_WINDOWS_DOTNETRUNTIME_PROVIDER_DOTNET_Context, ThreadPoolWorkerThreadStart))
@@ -1956,59 +1955,12 @@ Work:
     GCX_PREEMP_NO_DTOR();
     _ASSERTE(pThread == NULL || !pThread->PreemptiveGCDisabled());
 
-    // make sure there's really work.  If not, go back to sleep
+    _ASSERTE(WorkerCounter.GetCleanCounts().NumActive > 0);
+    _ASSERTE(WorkerCounter.GetCleanCounts().NumWorking > 0);
 
-    // counts volatile read paired with CompareExchangeCounts loop set
-    counts = WorkerCounter.DangerousGetDirtyCounts();
-    while (true)
-    {
-        _ASSERTE(counts.NumActive > 0);
-        _ASSERTE(counts.NumWorking > 0);
-
-        newCounts = counts;
-
-        bool retired;
-
-        if (counts.NumActive > counts.MaxWorking)
-        {
-            newCounts.NumActive--;
-            newCounts.NumRetired++;
-            retired = true;
-        }
-        else
-        {
-            retired = false;
-
-            if (foundWork)
-                break;
-        }
-
-        newCounts.NumWorking--;
-
-        oldCounts = WorkerCounter.CompareExchangeCounts(newCounts, counts);
-
-        if (oldCounts == counts)
-        {
-            if (retired)
-                goto Retire;
-            else
-                goto WaitForWork;
-        }
-
-        counts = oldCounts;
-    }
-
-    if (GCHeapUtilities::IsGCInProgress(TRUE))
-    {
-        // GC is imminent, so wait until GC is complete before executing next request.
-        // this reduces in-flight objects allocated right before GC, easing the GC's work
-        GCHeapUtilities::WaitForGCCompletion(TRUE);
-    }
-
-    {
-        ThreadpoolMgr::UpdateLastDequeueTime();
-        ThreadpoolMgr::ExecuteWorkRequest(&foundWork, &wasNotRecalled);
-    }
+    bool foundWork = true, wasNotRecalled = true;
+    ThreadpoolMgr::UpdateLastDequeueTime();
+    ThreadpoolMgr::ExecuteWorkRequest(&foundWork, &wasNotRecalled);
 
     if (foundWork)
     {
@@ -2024,8 +1976,27 @@ Work:
         }
     }
 
-    if (wasNotRecalled)
+    // if was recalled, then we must retire even if there is work.
+    // counts have been adjusted for the retirement already.
+    if (!wasNotRecalled)
+    {
+        goto Retire;
+    }
+
+    if (foundWork)
+    {
         goto Work;
+    }
+    else
+    {
+        ThreadCounter::Counts addCounts;
+        addCounts.AsLongLong = 0;
+        addCounts.NumWorking = 1;
+        addCounts.AsLongLong = -addCounts.AsLongLong;
+
+        WorkerCounter.InterlockedAddCounts(addCounts);
+        goto WaitForWork;
+    }
 
 Retire:
 
@@ -2045,8 +2016,6 @@ Retire:
 RetryRetire:
         if (RetiredWorkerSemaphore->Wait(AppX::IsAppXProcess() ? WorkerTimeoutAppX : WorkerTimeout))
         {
-            foundWork = true;
-
             counts = WorkerCounter.GetCleanCounts();
             FireEtwThreadPoolWorkerThreadRetirementStop(counts.NumActive, counts.NumRetired, GetClrInstanceId());
             goto Work;
@@ -2112,7 +2081,6 @@ WaitForWork:
     // and wake up a thread (maybe this one!) if there is work to do.
     if (PerAppDomainTPCountList::AreRequestsPendingInAnyAppDomains())
     {
-        foundWork = true;
         MaybeAddWorkingWorker();
     }
 
@@ -2122,7 +2090,6 @@ WaitForWork:
 RetryWaitForWork:
     if (WorkerSemaphore->Wait(AppX::IsAppXProcess() ? WorkerTimeoutAppX : WorkerTimeout, WorkerThreadSpinLimit, NumberOfProcessors))
     {
-        foundWork = true;
         goto Work;
     }
 

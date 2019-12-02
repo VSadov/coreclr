@@ -185,10 +185,10 @@ private:
         {
             struct
             {
-                UINT32 signalCount;
+                UINT16 signalCount;
                 UINT16 waiterCount;
-                UINT8 spinnerCount;
-                UINT8 countOfWaitersSignaledToWake;
+                UINT16 spinnerCount;
+                UINT16 countOfWaitersSignaledToWake;
             };
             UINT64 data;
         };
@@ -262,6 +262,9 @@ public:
 
 private:
     bool WaitForSignal(DWORD timeoutMs);
+    void WakeOne();
+    bool WaitForSignalOnce(DWORD timeoutMs);
+
 public:
     bool Wait(DWORD timeoutMs);
     bool Wait(DWORD timeoutMs, UINT32 spinCount, UINT32 processorCount);

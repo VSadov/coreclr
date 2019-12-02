@@ -112,9 +112,6 @@ public:
     {
         static const int MaxPossibleCount = 0x7fff;
 
-        // padding to ensure we get our own cache line
-        BYTE padding1[MAX_CACHE_LINE_SIZE];
-
         union Counts
         {
             struct
@@ -136,10 +133,6 @@ public:
 
             bool operator==(Counts other) {LIMITED_METHOD_CONTRACT; return AsLongLong == other.AsLongLong;}
         } counts;
-
-        // padding to ensure we get our own cache line
-        BYTE padding2[MAX_CACHE_LINE_SIZE];
-
         Counts GetCleanCounts()
         {
             LIMITED_METHOD_CONTRACT;
@@ -195,6 +188,18 @@ public:
             result.AsLongLong = 0; //prevents prefast warning for DAC builds
 #endif
             return result;
+        }
+
+        void InterlockedAddCounts(Counts addCounts)
+        {
+            LIMITED_METHOD_CONTRACT;
+            Counts result;
+#ifndef DACCESS_COMPILE
+            result.AsLongLong = InterlockedExchangeAdd64(&counts.AsLongLong, addCounts.AsLongLong) + addCounts.AsLongLong;
+            ValidateCounts(result);
+#else
+            result.AsLongLong = 0; //prevents prefast warning for DAC builds
+#endif
         }
 
     private:
