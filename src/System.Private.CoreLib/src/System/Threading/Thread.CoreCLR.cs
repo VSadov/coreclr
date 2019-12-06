@@ -532,13 +532,15 @@ namespace System.Threading
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static int GetCurrentProcessorId()
         {
-            int currentProcessorIdCache = t_currentProcessorIdCache--;
-            if ((currentProcessorIdCache & ProcessorIdCacheCountDownMask) == 0)
-            {
-                return RefreshCurrentProcessorId();
-            }
+            return GetCurrentProcessorNumber();
 
-            return currentProcessorIdCache >> ProcessorIdCacheShift;
+            //int currentProcessorIdCache = t_currentProcessorIdCache--;
+            //if ((currentProcessorIdCache & ProcessorIdCacheCountDownMask) == 0)
+            //{
+            //    return RefreshCurrentProcessorId();
+            //}
+
+            //return currentProcessorIdCache >> ProcessorIdCacheShift;
         }
 
         internal void ResetThreadPoolThread()
